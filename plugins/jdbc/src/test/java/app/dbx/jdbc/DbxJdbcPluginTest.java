@@ -2,6 +2,8 @@ package app.dbx.jdbc;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -558,6 +560,30 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void showFullColumnsMetadataCompletesMysqlCompatibleTypesAndComments() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod(
+            "mergeShowFullColumnMetadata",
+            Connection.class,
+            ArrayNode.class,
+            String.class,
+            String.class
+        );
+        method.setAccessible(true);
+        ArrayNode columns = MAPPER.createArrayNode();
+        ObjectNode column = columns.addObject();
+        column.put("name", "name");
+        column.put("data_type", "varchar");
+        column.putNull("extra");
+        column.putNull("comment");
+
+        method.invoke(null, showFullColumnsConnection(), columns, "app", "people");
+
+        assertEquals("varchar(32)", columns.path(0).path("data_type").asText());
+        assertEquals("auto_increment", columns.path(0).path("extra").asText());
+        assertEquals("姓名", columns.path(0).path("comment").asText());
+    }
+
+    @Test
     void oracleMetadataObjectTypeAcceptsPackageBodyAliases() throws Exception {
         Method method = DbxJdbcPlugin.class.getDeclaredMethod("oracleMetadataObjectType", String.class);
         method.setAccessible(true);
@@ -740,6 +766,66 @@ final class DbxJdbcPluginTest {
                         default -> null;
                     };
                 }
+            }
+        );
+    }
+
+    private static Connection showFullColumnsConnection() {
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "createStatement" -> showFullColumnsStatement();
+                case "isClosed" -> false;
+                case "close" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static Statement showFullColumnsStatement() {
+        return (Statement) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Statement.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "executeQuery" -> showFullColumnsResultSet();
+                case "close" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static ResultSet showFullColumnsResultSet() {
+        String[] labels = { "Field", "Type", "Extra", "Comment" };
+        String[][] rows = { { "name", "varchar(32)", "auto_increment", "姓名" } };
+        return (ResultSet) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ResultSet.class },
+            new java.lang.reflect.InvocationHandler() {
+                private int index = -1;
+
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) {
+                    return switch (method.getName()) {
+                        case "next" -> ++index < rows.length;
+                        case "getMetaData" -> resultSetMeta(labels);
+                        case "getString" -> rows[index][((Integer) args[0]) - 1];
+                        case "close" -> null;
+                        default -> defaultValue(method.getReturnType());
+                    };
+                }
+            }
+        );
+    }
+
+    private static ResultSetMetaData resultSetMeta(String[] labels) {
+        return (ResultSetMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ResultSetMetaData.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getColumnCount" -> labels.length;
+                case "getColumnLabel", "getColumnName" -> labels[((Integer) args[0]) - 1];
+                default -> defaultValue(method.getReturnType());
             }
         );
     }
