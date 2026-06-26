@@ -59,6 +59,7 @@
     "fetch_table_read_page",
     "close_table_read_session",
     "get_explain_info",
+    "execute_batch",
     "execute_transaction",
     "disconnect",
     "shutdown"

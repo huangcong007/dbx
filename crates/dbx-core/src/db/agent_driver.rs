@@ -136,13 +136,14 @@ pub enum AgentMethod {
     FetchTableReadPage,
     CloseTableReadSession,
     GetExplainInfo,
+    ExecuteBatch,
     ExecuteTransaction,
     Disconnect,
     Shutdown,
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Handshake,
         Self::Connect,
         Self::TestConnection,
@@ -167,6 +168,7 @@ impl AgentMethod {
         Self::FetchTableReadPage,
         Self::CloseTableReadSession,
         Self::GetExplainInfo,
+        Self::ExecuteBatch,
         Self::ExecuteTransaction,
         Self::Disconnect,
         Self::Shutdown,
@@ -198,6 +200,7 @@ impl AgentMethod {
             Self::FetchTableReadPage => "fetch_table_read_page",
             Self::CloseTableReadSession => "close_table_read_session",
             Self::GetExplainInfo => "get_explain_info",
+            Self::ExecuteBatch => "execute_batch",
             Self::ExecuteTransaction => "execute_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
@@ -857,6 +860,21 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema)).await
     }
 
+    pub async fn execute_batch<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ExecuteBatch,
+            agent_transaction_params(database, statements, schema),
+            timeout_duration,
+        )
+        .await
+    }
+
     pub async fn call_mongo_method<T: DeserializeOwned + Send + 'static>(
         &mut self,
         method: MongoAgentMethod,
@@ -1369,6 +1387,7 @@ mod tests {
         assert_eq!(AgentMethod::StartTableRead.as_str(), "start_table_read");
         assert_eq!(AgentMethod::FetchTableReadPage.as_str(), "fetch_table_read_page");
         assert_eq!(AgentMethod::CloseTableReadSession.as_str(), "close_table_read_session");
+        assert_eq!(AgentMethod::ExecuteBatch.as_str(), "execute_batch");
         assert_eq!(AgentMethod::ExecuteTransaction.as_str(), "execute_transaction");
         assert_eq!(AgentMethod::Disconnect.as_str(), "disconnect");
         assert_eq!(AgentMethod::Shutdown.as_str(), "shutdown");
@@ -1409,6 +1428,7 @@ mod tests {
         let _execute_query_page = AgentDriverClient::execute_query_page::<serde_json::Value>;
         let _fetch_query_page = AgentDriverClient::fetch_query_page::<serde_json::Value>;
         let _close_query_session = AgentDriverClient::close_query_session::<serde_json::Value>;
+        let _execute_batch = AgentDriverClient::execute_batch::<serde_json::Value>;
         let _execute_transaction = AgentDriverClient::execute_transaction::<serde_json::Value>;
     }
 

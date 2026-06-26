@@ -151,6 +151,14 @@ public interface DatabaseAgent {
         return TransactionExecutor.executeUpdateStatements(conn, statements, schema, this::setSchemaSQL);
     }
 
+    default QueryResult executeBatch(List<String> statements, String schema) {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return BatchExecutor.executeBatchStatements(conn, statements, schema, this::setSchemaSQL);
+    }
+
     default String setSchemaSQL(String schema) {
         return "SET SCHEMA " + JdbcIdentifiers.INSTANCE.doubleQuote(schema);
     }

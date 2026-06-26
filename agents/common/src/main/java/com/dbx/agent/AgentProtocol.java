@@ -31,6 +31,7 @@ public final class AgentProtocol {
     public static final String METHOD_FETCH_TABLE_READ_PAGE = "fetch_table_read_page";
     public static final String METHOD_CLOSE_TABLE_READ_SESSION = "close_table_read_session";
     public static final String METHOD_GET_EXPLAIN_INFO = "get_explain_info";
+    public static final String METHOD_EXECUTE_BATCH = "execute_batch";
     public static final String METHOD_EXECUTE_TRANSACTION = "execute_transaction";
     public static final String METHOD_DISCONNECT = "disconnect";
     public static final String METHOD_SHUTDOWN = "shutdown";
@@ -102,6 +103,7 @@ public final class AgentProtocol {
         METHOD_FETCH_TABLE_READ_PAGE,
         METHOD_CLOSE_TABLE_READ_SESSION,
         METHOD_GET_EXPLAIN_INFO,
+        METHOD_EXECUTE_BATCH,
         METHOD_EXECUTE_TRANSACTION,
         METHOD_DISCONNECT,
         METHOD_SHUTDOWN

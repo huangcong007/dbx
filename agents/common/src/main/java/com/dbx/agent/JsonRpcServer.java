@@ -222,6 +222,11 @@ public final class JsonRpcServer {
             List<String> statements = gson.fromJson(params.get("statements"), statementsType);
             return agent.executeTransaction(statements, stringOrNull(params, "schema"));
         }
+        if (AgentProtocol.METHOD_EXECUTE_BATCH.equals(method)) {
+            Type statementsType = new TypeToken<List<String>>() {}.getType();
+            List<String> statements = gson.fromJson(params.get("statements"), statementsType);
+            return agent.executeBatch(statements, stringOrNull(params, "schema"));
+        }
         if (AgentProtocol.METHOD_DISCONNECT.equals(method)) {
             JdbcExecutor.INSTANCE.closeAllQuerySessions();
             JdbcExecutor.INSTANCE.closeAllTableReadSessions();
