@@ -63,7 +63,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { useToast } from "@/composables/useToast";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
-import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, DatabaseType, ObjectSourceKind, TreeNode, TreeNodeType } from "@/types/database";
 import * as api from "@/lib/api";
 import { uuid } from "@/lib/utils";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
@@ -1269,9 +1269,10 @@ async function generateDdlTemplate() {
     let ddl: string;
     if (node.type === "table") {
       ddl = await api.getTableDdl(node.connectionId, node.database, schema, node.label);
+    } else if (node.type === "materialized_view") {
+      ddl = await api.getTableDdl(node.connectionId, node.database, schema, node.label, "MATERIALIZED_VIEW");
     } else {
-      const objectType = node.type === "materialized_view" ? "MATERIALIZED_VIEW" : "VIEW";
-      const result = await api.getObjectSource(node.connectionId, node.database, schema, node.label, objectType);
+      const result = await api.getObjectSource(node.connectionId, node.database, schema, node.label, "VIEW");
       ddl = await buildViewDdl({
         databaseType: currentDatabaseType(),
         schema,
@@ -2576,7 +2577,7 @@ async function exportStructure() {
     const parts: string[] = [];
     for (const target of targets) {
       await connectionStore.ensureConnected(target.connectionId);
-      const ddl = await api.getTableDdl(target.connectionId, target.database, target.schema || target.database, target.label, target.type === "view" ? "VIEW" : undefined);
+      const ddl = await api.getTableDdl(target.connectionId, target.database, target.schema || target.database, target.label, tableDdlObjectTypeForNode(target.type));
       parts.push(ddl.trim());
     }
     structurePreviewSql.value = `${parts.filter(Boolean).join("\n\n")}\n`;
@@ -2589,7 +2590,13 @@ async function exportStructure() {
 }
 
 function canExportStructureNode(node: TreeNode): node is TreeNode & { connectionId: string; database: string } {
-  return (node.type === "table" || node.type === "view") && !!node.connectionId && !!node.database;
+  return (node.type === "table" || node.type === "view" || node.type === "materialized_view") && !!node.connectionId && !!node.database;
+}
+
+function tableDdlObjectTypeForNode(type: TreeNodeType): ObjectSourceKind | undefined {
+  if (type === "view") return "VIEW";
+  if (type === "materialized_view") return "MATERIALIZED_VIEW";
+  return undefined;
 }
 
 function selectedStructureNodes(): TreeNode[] {
