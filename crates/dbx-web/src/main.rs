@@ -478,6 +478,12 @@ async fn main() {
         )
         .route("/saved-sql/folders", post(routes::saved_sql::save_saved_sql_folder))
         .route("/saved-sql/folders/{id}", delete(routes::saved_sql::delete_saved_sql_folder))
+        // Transfer tasks
+        .route(
+            "/transfer-tasks",
+            get(routes::transfer_task::load_transfer_tasks).post(routes::transfer_task::save_transfer_task),
+        )
+        .route("/transfer-tasks/{id}", delete(routes::transfer_task::delete_transfer_task))
         // AI
         .route("/ai/config", post(routes::ai::save_ai_config).get(routes::ai::load_ai_config))
         .route("/ai/provider-config", post(routes::ai::save_ai_provider_config))

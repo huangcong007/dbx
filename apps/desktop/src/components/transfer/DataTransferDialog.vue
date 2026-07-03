@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { uuid } from "@/lib/utils";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -8,17 +8,21 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import SearchableSelect from "@/components/ui/searchable-select/SearchableSelect.vue";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useTransferTaskStore } from "@/stores/transferTaskStore";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/api";
-import type { TransferMode, TransferTableNameCase } from "@/lib/api";
+import type { TransferMode, TransferTableNameCase, TransferTask } from "@/lib/api";
 import type { DatabaseType } from "@/types/database";
 import { isSchemaAware, supportsTransfer } from "@/lib/databaseCapabilities";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { useExportTracker } from "@/composables/useExportTracker";
-import { ArrowRightLeft, ArrowLeftRight, Loader2, Square, CheckSquare } from "@lucide/vue";
+import { useToast } from "@/composables/useToast";
+import { ArrowRightLeft, ArrowLeftRight, Loader2, Square, CheckSquare, Play, Pencil, Trash2, Bookmark } from "@lucide/vue";
 
 const { t } = useI18n();
+const { toast } = useToast();
 const { startDataTransferTask } = useExportTracker();
 const open = defineModel<boolean>("open", { default: false });
 
@@ -28,6 +32,17 @@ const props = defineProps<{
 }>();
 
 const store = useConnectionStore();
+const taskStore = useTransferTaskStore();
+
+const activeTab = ref<"new" | "tasks">("new");
+const editingTaskId = ref("");
+const taskName = ref("");
+const showSaveTaskDialog = ref(false);
+const isSavingTask = ref(false);
+const pendingExecuteTask = ref<TransferTask | null>(null);
+const showExecuteConfirm = ref(false);
+const loadingTask = ref(false);
+const pendingTableSelection = ref<string[] | null>(null);
 
 const sqlConnections = computed(() => store.connections.filter((c) => supportsTransfer(c.db_type)));
 
@@ -58,10 +73,14 @@ const isSubmitting = ref(false);
 
 const filteredTables = computed(() => {
   const q = tableSearch.value.toLowerCase();
-  return q ? sourceTables.value.filter((t) => t.toLowerCase().includes(q)) : sourceTables.value;
+  return q ? sourceTables.value.filter((table) => table.toLowerCase().includes(q)) : sourceTables.value;
 });
 
-const allSelected = computed(() => filteredTables.value.length > 0 && filteredTables.value.every((t) => selectedTables.value.has(t)));
+const allSelected = computed(() => filteredTables.value.length > 0 && filteredTables.value.every((table) => selectedTables.value.has(table)));
+
+const canStart = computed(() => sourceConnectionId.value && sourceDatabase.value && targetConnectionId.value && targetDatabase.value && selectedTables.value.size > 0 && sourceConnectionId.value + sourceDatabase.value !== targetConnectionId.value + targetDatabase.value);
+
+const canSaveTask = computed(() => canStart.value && taskName.value.trim().length > 0);
 
 function connectionType(id: string): DatabaseType | undefined {
   return store.connections.find((c) => c.id === id)?.db_type;
@@ -71,13 +90,87 @@ function isMongoConnection(id: string): boolean {
   return connectionType(id) === "mongodb";
 }
 
-const canStart = computed(() => sourceConnectionId.value && sourceDatabase.value && targetConnectionId.value && targetDatabase.value && selectedTables.value.size > 0 && sourceConnectionId.value + sourceDatabase.value !== targetConnectionId.value + targetDatabase.value);
+function getConnectionName(id: string) {
+  return store.connections.find((c) => c.id === id)?.name ?? id;
+}
+
+function modeLabel(mode: TransferMode) {
+  if (mode === "overwrite") return t("transfer.modeOverwrite");
+  if (mode === "upsert") return t("transfer.modeUpsert");
+  return t("transfer.modeAppend");
+}
+
+function buildTaskSummary(task: TransferTask) {
+  return [
+    `${t("transfer.taskName")}: ${task.name}`,
+    `${t("transfer.source")}: ${getConnectionName(task.sourceConnectionId)} / ${task.sourceDatabase}`,
+    `${t("transfer.target")}: ${getConnectionName(task.targetConnectionId)} / ${task.targetDatabase}`,
+    `${t("transfer.tables")}: ${task.tables.length}`,
+    `${t("transfer.transferMode")}: ${modeLabel(task.mode)}`,
+    `${t("transfer.createTable")}: ${task.createTable ? t("transfer.yes") : t("transfer.no")}`,
+    `${t("transfer.batchSize")}: ${task.batchSize}`,
+  ].join("\n");
+}
+
+function currentTaskInput() {
+  return {
+    id: editingTaskId.value || undefined,
+    name: taskName.value.trim(),
+    sourceConnectionId: sourceConnectionId.value,
+    sourceDatabase: sourceDatabase.value,
+    sourceSchema: sourceSchema.value || sourceDatabase.value,
+    targetConnectionId: targetConnectionId.value,
+    targetDatabase: targetDatabase.value,
+    targetSchema: targetSchema.value || targetDatabase.value,
+    tables: [...selectedTables.value],
+    createTable: createTable.value,
+    mode: transferMode.value,
+    targetTableNameCase: targetTableNameCase.value,
+    batchSize: batchSize.value,
+  };
+}
+
+function buildTransferRequestFromForm(transferId = uuid()): api.TransferRequest {
+  const effectiveSourceSchema = sourceSchema.value || sourceDatabase.value;
+  const effectiveTargetSchema = targetSchema.value || targetDatabase.value;
+  return {
+    transferId,
+    sourceConnectionId: sourceConnectionId.value,
+    sourceDatabase: sourceDatabase.value,
+    sourceSchema: effectiveSourceSchema,
+    targetConnectionId: targetConnectionId.value,
+    targetDatabase: targetDatabase.value,
+    targetSchema: effectiveTargetSchema,
+    tables: [...selectedTables.value],
+    createTable: createTable.value,
+    mode: transferMode.value,
+    targetTableNameCase: targetTableNameCase.value,
+    batchSize: batchSize.value,
+  };
+}
+
+function buildTransferRequestFromTask(task: TransferTask, transferId = uuid()): api.TransferRequest {
+  return {
+    transferId,
+    sourceConnectionId: task.sourceConnectionId,
+    sourceDatabase: task.sourceDatabase,
+    sourceSchema: task.sourceSchema,
+    targetConnectionId: task.targetConnectionId,
+    targetDatabase: task.targetDatabase,
+    targetSchema: task.targetSchema,
+    tables: [...task.tables],
+    createTable: task.createTable,
+    mode: task.mode,
+    targetTableNameCase: task.targetTableNameCase,
+    batchSize: task.batchSize,
+  };
+}
 
 function toggleSelectAll() {
   if (allSelected.value) {
-    filteredTables.value.forEach((t) => selectedTables.value.delete(t));
+    filteredTables.value.forEach((table) => selectedTables.value.delete(table));
   } else {
-    filteredTables.value.forEach((t) => selectedTables.value.add(t));
+    filteredTables.value.forEach((table) => selectedTables.value.add(table));
   }
 }
 
@@ -89,7 +182,7 @@ function toggleTable(table: string) {
   }
 }
 
-async function loadDatabases(connectionId: string, target: "source" | "target") {
+async function loadDatabases(connectionId: string, target: "source" | "target", preferredDatabase = "") {
   if (!connectionId) return;
   try {
     await store.ensureConnected(connectionId);
@@ -97,12 +190,13 @@ async function loadDatabases(connectionId: string, target: "source" | "target") 
     const names = databaseOptionsForConnection(rawNames, store.getConfig(connectionId));
     if (target === "source") {
       sourceDatabases.value = names;
-      sourceDatabase.value = names.length === 1 ? names[0] : "";
+      sourceDatabase.value = preferredDatabase && names.includes(preferredDatabase) ? preferredDatabase : names.length === 1 ? names[0] : "";
     } else {
       targetDatabases.value = names;
-      targetDatabase.value = names.length === 1 ? names[0] : "";
+      targetDatabase.value = preferredDatabase && names.includes(preferredDatabase) ? preferredDatabase : names.length === 1 ? names[0] : "";
     }
-  } catch {
+  } catch (err: any) {
+    toast(err?.message || String(err), 5000);
     if (target === "source") sourceDatabases.value = [];
     else targetDatabases.value = [];
   }
@@ -150,15 +244,20 @@ async function loadTables() {
   try {
     if (isMongoConnection(sourceConnectionId.value)) {
       sourceTables.value = (await api.mongoListCollections(sourceConnectionId.value, sourceDatabase.value)).map((c) => c.name);
-      selectedTables.value = new Set(sourceTables.value);
-      return;
+    } else {
+      const config = store.getConfig(sourceConnectionId.value);
+      const needsSchema = isSchemaAware(config?.db_type);
+      const schema = needsSchema && sourceSchema.value ? sourceSchema.value : sourceDatabase.value;
+      const tables = await api.listTables(sourceConnectionId.value, sourceDatabase.value, schema);
+      sourceTables.value = tables.filter((table) => table.table_type === "TABLE" || table.table_type === "BASE TABLE").map((table) => table.name);
     }
-    const config = store.getConfig(sourceConnectionId.value);
-    const needsSchema = isSchemaAware(config?.db_type);
-    const schema = needsSchema && sourceSchema.value ? sourceSchema.value : sourceDatabase.value;
-    const tables = await api.listTables(sourceConnectionId.value, sourceDatabase.value, schema);
-    sourceTables.value = tables.filter((t) => t.table_type === "TABLE" || t.table_type === "BASE TABLE").map((t) => t.name);
-    selectedTables.value = new Set(sourceTables.value);
+    const preferred = pendingTableSelection.value;
+    if (preferred) {
+      selectedTables.value = new Set(preferred.filter((table) => sourceTables.value.includes(table)));
+      pendingTableSelection.value = null;
+    } else if (selectedTables.value.size === 0) {
+      selectedTables.value = new Set(sourceTables.value);
+    }
   } catch {
     sourceTables.value = [];
   } finally {
@@ -167,6 +266,7 @@ async function loadTables() {
 }
 
 const skipSourceWatch = ref(false);
+const skipTargetWatch = ref(false);
 
 watch(sourceConnectionId, (id) => {
   if (skipSourceWatch.value) {
@@ -176,37 +276,42 @@ watch(sourceConnectionId, (id) => {
   sourceDatabase.value = "";
   sourceTables.value = [];
   selectedTables.value.clear();
-  loadDatabases(id, "source");
+  void loadDatabases(id, "source");
 });
 
 watch(sourceDatabase, async (db) => {
-  if (db) {
-    const config = store.getConfig(sourceConnectionId.value);
-    if (isSchemaAware(config?.db_type)) {
-      await loadSchemas(sourceConnectionId.value, db, "source");
-    } else {
-      sourceSchema.value = db;
-    }
+  if (!db || loadingTask.value) return;
+  const config = store.getConfig(sourceConnectionId.value);
+  if (isSchemaAware(config?.db_type)) {
+    await loadSchemas(sourceConnectionId.value, db, "source");
+  } else {
+    sourceSchema.value = db;
   }
 });
 
-watch(sourceSchema, () => loadTables());
+watch(sourceSchema, () => {
+  if (loadingTask.value) return;
+  void loadTables();
+});
 
 watch(targetConnectionId, (id) => {
+  if (skipTargetWatch.value) {
+    skipTargetWatch.value = false;
+    return;
+  }
   targetDatabase.value = "";
   targetSchemas.value = [];
   targetSchema.value = "";
-  loadDatabases(id, "target");
+  void loadDatabases(id, "target");
 });
 
 watch(targetDatabase, async (db) => {
-  if (db) {
-    const config = store.getConfig(targetConnectionId.value);
-    if (isSchemaAware(config?.db_type)) {
-      await loadSchemas(targetConnectionId.value, db, "target");
-    } else {
-      targetSchema.value = db;
-    }
+  if (!db || loadingTask.value) return;
+  const config = store.getConfig(targetConnectionId.value);
+  if (isSchemaAware(config?.db_type)) {
+    await loadSchemas(targetConnectionId.value, db, "target");
+  } else {
+    targetSchema.value = db;
   }
 });
 
@@ -214,10 +319,14 @@ watch(
   open,
   async (val) => {
     if (val) {
+      await taskStore.initFromStorage();
       resetState();
+      activeTab.value = "new";
       if (props.prefillConnectionId) {
         skipSourceWatch.value = true;
         sourceConnectionId.value = props.prefillConnectionId;
+        await nextTick();
+        skipSourceWatch.value = false;
         await loadDatabases(props.prefillConnectionId, "source");
         if (props.prefillDatabase) {
           sourceDatabase.value = props.prefillDatabase;
@@ -229,6 +338,9 @@ watch(
 );
 
 function resetState() {
+  activeTab.value = "new";
+  editingTaskId.value = "";
+  taskName.value = "";
   sourceConnectionId.value = "";
   sourceDatabase.value = "";
   sourceDatabases.value = [];
@@ -247,35 +359,87 @@ function resetState() {
   targetTableNameCase.value = "preserve";
   batchSize.value = 1000;
   isSubmitting.value = false;
+  pendingTableSelection.value = null;
+  skipSourceWatch.value = false;
+  skipTargetWatch.value = false;
 }
 
-async function startTransfer() {
-  if (!canStart.value || isSubmitting.value) return;
-  isSubmitting.value = true;
+async function loadTaskIntoForm(task: TransferTask) {
+  loadingTask.value = true;
+  editingTaskId.value = task.id;
+  taskName.value = task.name;
+  createTable.value = task.createTable;
+  transferMode.value = task.mode;
+  targetTableNameCase.value = task.targetTableNameCase;
+  batchSize.value = task.batchSize;
+  pendingTableSelection.value = [...task.tables];
+  selectedTables.value = new Set(task.tables);
 
-  const effectiveSourceSchema = sourceSchema.value || sourceDatabase.value;
-  const effectiveTargetSchema = targetSchema.value || targetDatabase.value;
-  const sourceDatabaseName = sourceDatabase.value;
-  const targetConnection = targetConnectionId.value;
-  const targetDatabaseName = targetDatabase.value;
-  const shouldRefreshTargetTree = createTable.value;
+  skipSourceWatch.value = true;
+  sourceConnectionId.value = task.sourceConnectionId;
+  await nextTick();
+  skipSourceWatch.value = false;
+  await loadDatabases(task.sourceConnectionId, "source", task.sourceDatabase);
+  sourceDatabase.value = task.sourceDatabase;
+  const sourceConfig = store.getConfig(task.sourceConnectionId);
+  if (isSchemaAware(sourceConfig?.db_type)) {
+    await loadSchemas(task.sourceConnectionId, task.sourceDatabase, "source", task.sourceSchema);
+  } else {
+    sourceSchema.value = task.sourceSchema;
+  }
+  await loadTables();
 
-  const request: api.TransferRequest = {
-    transferId: uuid(),
-    sourceConnectionId: sourceConnectionId.value,
-    sourceDatabase: sourceDatabaseName,
-    sourceSchema: effectiveSourceSchema,
-    targetConnectionId: targetConnection,
-    targetDatabase: targetDatabaseName,
-    targetSchema: effectiveTargetSchema,
-    tables: [...selectedTables.value],
-    createTable: createTable.value,
-    mode: transferMode.value,
-    targetTableNameCase: targetTableNameCase.value,
-    batchSize: batchSize.value,
-  };
+  skipTargetWatch.value = true;
+  targetConnectionId.value = task.targetConnectionId;
+  await nextTick();
+  skipTargetWatch.value = false;
+  await loadDatabases(task.targetConnectionId, "target", task.targetDatabase);
+  targetDatabase.value = task.targetDatabase;
+  const targetConfig = store.getConfig(task.targetConnectionId);
+  if (isSchemaAware(targetConfig?.db_type)) {
+    await loadSchemas(task.targetConnectionId, task.targetDatabase, "target", task.targetSchema);
+  } else {
+    targetSchema.value = task.targetSchema;
+  }
 
-  startDataTransferTask(request, `${sourceDatabaseName} → ${targetDatabaseName}`, {
+  loadingTask.value = false;
+  activeTab.value = "new";
+}
+
+function openSaveTaskDialog() {
+  if (!canStart.value) return;
+  if (!taskName.value.trim()) {
+    const source = getConnectionName(sourceConnectionId.value);
+    const target = getConnectionName(targetConnectionId.value);
+    taskName.value = `${source} → ${target}`;
+  }
+  showSaveTaskDialog.value = true;
+}
+
+async function saveCurrentTask() {
+  if (!canSaveTask.value || isSavingTask.value) return;
+  isSavingTask.value = true;
+  try {
+    const saved = await taskStore.saveTask(currentTaskInput());
+    editingTaskId.value = saved.id;
+    taskName.value = saved.name;
+    toast(t("transfer.taskSaved"), 2000);
+    showSaveTaskDialog.value = false;
+    if (!editingTaskId.value) {
+      taskName.value = "";
+    }
+  } catch (error: any) {
+    toast(error?.message || String(error), 4000);
+  } finally {
+    isSavingTask.value = false;
+  }
+}
+
+function runTransfer(request: api.TransferRequest, label: string, shouldRefreshTargetTree: boolean) {
+  const targetConnection = request.targetConnectionId;
+  const targetDatabaseName = request.targetDatabase;
+  const effectiveTargetSchema = request.targetSchema;
+  startDataTransferTask(request, label, {
     formatOverlapError: (tables) => t("transfer.targetTableBusy", { tables: tables.join(", ") }),
     onDone: async () => {
       if (shouldRefreshTargetTree) {
@@ -283,12 +447,59 @@ async function startTransfer() {
       }
     },
   });
+}
+
+async function startTransfer() {
+  if (!canStart.value || isSubmitting.value) return;
+  isSubmitting.value = true;
+  const request = buildTransferRequestFromForm();
+  runTransfer(request, `${request.sourceDatabase} → ${request.targetDatabase}`, createTable.value);
+  open.value = false;
+  resetState();
+  isSubmitting.value = false;
+}
+
+function requestExecuteTask(task: TransferTask) {
+  pendingExecuteTask.value = task;
+  showExecuteConfirm.value = true;
+}
+
+async function confirmExecuteTask() {
+  const task = pendingExecuteTask.value;
+  if (!task) return;
+  const request = buildTransferRequestFromTask(task);
+  runTransfer(request, task.name, task.createTable);
+  await taskStore.recordTaskRun(task.id);
+  pendingExecuteTask.value = null;
+  showExecuteConfirm.value = false;
   open.value = false;
   resetState();
 }
 
-function getConnectionName(id: string) {
-  return store.connections.find((c) => c.id === id)?.name ?? id;
+async function editTask(task: TransferTask) {
+  await loadTaskIntoForm(task);
+}
+
+async function removeTask(task: TransferTask) {
+  try {
+    await taskStore.deleteTask(task.id);
+    if (editingTaskId.value === task.id) {
+      editingTaskId.value = "";
+      taskName.value = "";
+    }
+    toast(t("transfer.taskDeleted"), 2000);
+  } catch (error: any) {
+    toast(error?.message || String(error), 4000);
+  }
+}
+
+function formatLastRunAt(value?: string | null) {
+  if (!value) return t("transfer.taskNeverRun");
+  try {
+    return new Date(value).toLocaleString();
+  } catch {
+    return value;
+  }
 }
 </script>
 
@@ -302,11 +513,56 @@ function getConnectionName(id: string) {
         </DialogTitle>
       </DialogHeader>
 
-      <div class="flex-1 min-h-0 overflow-auto">
+      <div class="flex gap-2 border-b pb-2">
+        <Button variant="ghost" size="sm" class="h-7 text-xs" :class="activeTab === 'new' ? 'bg-muted' : ''" @click="activeTab = 'new'">
+          {{ t("transfer.newTask") }}
+        </Button>
+        <Button variant="ghost" size="sm" class="h-7 text-xs" :class="activeTab === 'tasks' ? 'bg-muted' : ''" @click="activeTab = 'tasks'">
+          {{ t("transfer.savedTasks") }}
+          <span v-if="taskStore.allTasks.length" class="ml-1 text-muted-foreground">({{ taskStore.allTasks.length }})</span>
+        </Button>
+      </div>
+
+      <div v-if="activeTab === 'tasks'" class="flex-1 min-h-0 overflow-auto py-3">
+        <div v-if="taskStore.allTasks.length === 0" class="text-xs text-muted-foreground py-8 text-center">
+          {{ t("transfer.noSavedTasks") }}
+        </div>
+        <div v-else class="space-y-2">
+          <div v-for="task in taskStore.allTasks" :key="task.id" class="border rounded-md p-3 space-y-2">
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0">
+                <div class="text-sm font-medium truncate">{{ task.name }}</div>
+                <div class="text-xs text-muted-foreground mt-1">
+                  {{ getConnectionName(task.sourceConnectionId) }} / {{ task.sourceDatabase }}
+                  →
+                  {{ getConnectionName(task.targetConnectionId) }} / {{ task.targetDatabase }}
+                </div>
+                <div class="text-xs text-muted-foreground mt-1">
+                  {{ t("transfer.taskMeta", { tables: task.tables.length, mode: modeLabel(task.mode) }) }}
+                </div>
+                <div class="text-xs text-muted-foreground mt-1">
+                  {{ t("transfer.taskLastRun", { time: formatLastRunAt(task.lastRunAt) }) }}
+                </div>
+              </div>
+              <div class="flex items-center gap-1 shrink-0">
+                <Button variant="outline" size="icon-xs" :title="t('transfer.executeTask')" @click="requestExecuteTask(task)">
+                  <Play class="w-3.5 h-3.5" />
+                </Button>
+                <Button variant="outline" size="icon-xs" :title="t('transfer.editConfig')" @click="editTask(task)">
+                  <Pencil class="w-3.5 h-3.5" />
+                </Button>
+                <Button variant="outline" size="icon-xs" :title="t('transfer.deleteTask')" @click="removeTask(task)">
+                  <Trash2 class="w-3.5 h-3.5" />
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="flex-1 min-h-0 overflow-auto">
         <div class="grid gap-4 py-3">
-          <!-- Source / Target Side by Side -->
           <div class="grid grid-cols-[1fr_auto_1fr] gap-4 items-start">
-            <!-- Source Section -->
             <div class="space-y-3">
               <div class="text-sm font-medium text-blue-500">
                 {{ t("transfer.source") }}
@@ -364,12 +620,10 @@ function getConnectionName(id: string) {
               </div>
             </div>
 
-            <!-- Arrow -->
             <div class="flex items-center pt-8">
               <ArrowLeftRight class="w-5 h-5 text-muted-foreground" />
             </div>
 
-            <!-- Target Section -->
             <div class="space-y-3">
               <div class="text-sm font-medium text-green-500">
                 {{ t("transfer.target") }}
@@ -428,7 +682,6 @@ function getConnectionName(id: string) {
             </div>
           </div>
 
-          <!-- Tables Section -->
           <div class="space-y-2">
             <div class="flex items-center justify-between">
               <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
@@ -461,7 +714,6 @@ function getConnectionName(id: string) {
             </div>
           </div>
 
-          <!-- Options -->
           <div class="space-y-2.5">
             <div class="flex items-center gap-2 cursor-pointer text-xs" @click="createTable = !createTable">
               <CheckSquare v-if="createTable" class="w-3.5 h-3.5 text-primary shrink-0" />
@@ -502,9 +754,13 @@ function getConnectionName(id: string) {
         </div>
       </div>
 
-      <DialogFooter>
+      <DialogFooter v-if="activeTab === 'new'">
         <Button variant="outline" size="sm" @click="open = false">
           {{ t("transfer.cancel") }}
+        </Button>
+        <Button variant="outline" size="sm" :disabled="!canStart" @click="openSaveTaskDialog">
+          <Bookmark class="w-3.5 h-3.5 mr-1.5" />
+          {{ editingTaskId ? t("transfer.updateTask") : t("transfer.saveAsTask") }}
         </Button>
         <Button size="sm" :disabled="!canStart || isSubmitting" @click="startTransfer">
           <Loader2 v-if="isSubmitting" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
@@ -512,6 +768,39 @@ function getConnectionName(id: string) {
           {{ t("transfer.start") }}
         </Button>
       </DialogFooter>
+      <DialogFooter v-else>
+        <Button variant="outline" size="sm" @click="open = false">
+          {{ t("transfer.cancel") }}
+        </Button>
+      </DialogFooter>
     </DialogContent>
   </Dialog>
+
+  <Dialog v-model:open="showSaveTaskDialog">
+    <DialogContent class="sm:max-w-[420px]" @interact-outside.prevent>
+      <DialogHeader>
+        <DialogTitle>{{ editingTaskId ? t("transfer.updateTask") : t("transfer.saveAsTask") }}</DialogTitle>
+      </DialogHeader>
+      <div class="space-y-2 py-2">
+        <Label class="text-xs">{{ t("transfer.taskName") }}</Label>
+        <Input v-model="taskName" :placeholder="t('transfer.taskNamePlaceholder')" class="h-8 text-xs" />
+      </div>
+      <DialogFooter>
+        <Button variant="outline" size="sm" @click="showSaveTaskDialog = false">{{ t("transfer.cancel") }}</Button>
+        <Button size="sm" :disabled="!canSaveTask || isSavingTask" @click="saveCurrentTask">
+          <Loader2 v-if="isSavingTask" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
+          {{ t("common.save") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <DangerConfirmDialog
+    v-model:open="showExecuteConfirm"
+    :title="t('transfer.executeConfirmTitle')"
+    :message="t('transfer.executeConfirmMessage')"
+    :details-text="pendingExecuteTask ? buildTaskSummary(pendingExecuteTask) : ''"
+    :confirm-label="t('transfer.executeTask')"
+    @confirm="confirmExecuteTask"
+  />
 </template>
