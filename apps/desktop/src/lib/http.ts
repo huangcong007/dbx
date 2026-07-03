@@ -70,6 +70,7 @@ import type {
   SqlFileProgress,
   TransferRequest,
   TransferProgress,
+  TransferTask,
   TableImportPreview,
   TableImportRequest,
   TableImportSummary,
@@ -434,6 +435,18 @@ export async function saveSavedSqlFile(file: SavedSqlFile): Promise<SavedSqlFile
 
 export async function deleteSavedSqlFile(id: string): Promise<void> {
   return del(`/api/saved-sql/${encodeURIComponent(id)}`);
+}
+
+export async function loadTransferTasks(): Promise<TransferTask[]> {
+  return get("/api/transfer-tasks");
+}
+
+export async function saveTransferTask(task: TransferTask): Promise<TransferTask> {
+  return post("/api/transfer-tasks", task);
+}
+
+export async function deleteTransferTask(id: string): Promise<void> {
+  return del(`/api/transfer-tasks/${encodeURIComponent(id)}`);
 }
 
 export async function savedSqlStorageDir(): Promise<string> {

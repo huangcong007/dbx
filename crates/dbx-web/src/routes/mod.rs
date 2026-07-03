@@ -29,5 +29,6 @@ pub mod table_export;
 pub mod table_import;
 pub mod text_export;
 pub mod transfer;
+pub mod transfer_task;
 pub mod update;
 pub mod zookeeper;

@@ -15,6 +15,8 @@ use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
 use crate::history::{HistoryEntry, MAX_HISTORY};
 use crate::models::connection::{ConnectionConfig, DatabaseType, TransportLayerConfig};
 use crate::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
+use crate::transfer::{TransferMode, TransferTableNameCase};
+use crate::transfer_task::TransferTask;
 
 const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
 const TRANSPORT_LAYER_SECRET_PREFIX: &str = "transport_layers.";
@@ -27,6 +29,7 @@ const USER_DATA_TABLES: &[&str] = &[
     "mq_token_records",
     "saved_sql_folders",
     "saved_sql_files",
+    "transfer_tasks",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +271,25 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         order_index INTEGER NOT NULL DEFAULT 0,
         open_count INTEGER NOT NULL DEFAULT 0,
         opened_at TEXT,
+        created_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE TABLE IF NOT EXISTS transfer_tasks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        source_connection_id TEXT NOT NULL,
+        source_database TEXT NOT NULL DEFAULT '',
+        source_schema TEXT NOT NULL DEFAULT '',
+        target_connection_id TEXT NOT NULL,
+        target_database TEXT NOT NULL DEFAULT '',
+        target_schema TEXT NOT NULL DEFAULT '',
+        tables_json TEXT NOT NULL DEFAULT '[]',
+        create_table INTEGER NOT NULL DEFAULT 1,
+        mode TEXT NOT NULL DEFAULT 'append',
+        target_table_name_case TEXT NOT NULL DEFAULT 'preserve',
+        batch_size INTEGER NOT NULL DEFAULT 1000,
+        order_index INTEGER NOT NULL DEFAULT 0,
+        last_run_at TEXT,
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT ''
     )",
@@ -1561,6 +1583,118 @@ impl Storage {
         let id = id.to_string();
         self.with_conn(move |conn| {
             conn.execute("DELETE FROM saved_sql_files WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_transfer_tasks(&self) -> Result<Vec<TransferTask>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, source_connection_id, source_database, source_schema, \
+                     target_connection_id, target_database, target_schema, tables_json, create_table, \
+                     mode, target_table_name_case, batch_size, order_index, last_run_at, created_at, updated_at \
+                     FROM transfer_tasks ORDER BY order_index, name COLLATE NOCASE",
+                )
+                .map_err(|e| e.to_string())?;
+            let tasks = stmt
+                .query_map([], |row| {
+                    let tables_json: String = row.get(8)?;
+                    let tables: Vec<String> = serde_json::from_str(&tables_json).unwrap_or_default();
+                    let mode_raw: String = row.get(10)?;
+                    let mode: TransferMode = serde_json::from_str(&format!("\"{mode_raw}\"")).unwrap_or_default();
+                    let case_raw: String = row.get(11)?;
+                    let target_table_name_case: TransferTableNameCase =
+                        serde_json::from_str(&format!("\"{case_raw}\"")).unwrap_or_default();
+                    Ok(TransferTask {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        source_connection_id: row.get(2)?,
+                        source_database: row.get(3)?,
+                        source_schema: row.get(4)?,
+                        target_connection_id: row.get(5)?,
+                        target_database: row.get(6)?,
+                        target_schema: row.get(7)?,
+                        tables,
+                        create_table: row.get::<_, i64>(9)? != 0,
+                        mode,
+                        target_table_name_case,
+                        batch_size: row.get::<_, i64>(12)? as usize,
+                        order_index: row.get(13)?,
+                        last_run_at: row.get(14)?,
+                        created_at: row.get(15)?,
+                        updated_at: row.get(16)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(tasks)
+        })
+        .await
+    }
+
+    pub async fn save_transfer_task(&self, task: &TransferTask) -> Result<(), String> {
+        let task = task.clone();
+        let tables_json = serde_json::to_string(&task.tables).map_err(|e| e.to_string())?;
+        let mode = serde_json::to_string(&task.mode).map_err(|e| e.to_string())?.trim_matches('"').to_string();
+        let target_table_name_case = serde_json::to_string(&task.target_table_name_case)
+            .map_err(|e| e.to_string())?
+            .trim_matches('"')
+            .to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO transfer_tasks \
+                 (id, name, source_connection_id, source_database, source_schema, \
+                 target_connection_id, target_database, target_schema, tables_json, create_table, \
+                 mode, target_table_name_case, batch_size, order_index, last_run_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 name = excluded.name, \
+                 source_connection_id = excluded.source_connection_id, \
+                 source_database = excluded.source_database, \
+                 source_schema = excluded.source_schema, \
+                 target_connection_id = excluded.target_connection_id, \
+                 target_database = excluded.target_database, \
+                 target_schema = excluded.target_schema, \
+                 tables_json = excluded.tables_json, \
+                 create_table = excluded.create_table, \
+                 mode = excluded.mode, \
+                 target_table_name_case = excluded.target_table_name_case, \
+                 batch_size = excluded.batch_size, \
+                 order_index = excluded.order_index, \
+                 last_run_at = excluded.last_run_at, \
+                 updated_at = excluded.updated_at",
+                params![
+                    task.id,
+                    task.name,
+                    task.source_connection_id,
+                    task.source_database,
+                    task.source_schema,
+                    task.target_connection_id,
+                    task.target_database,
+                    task.target_schema,
+                    tables_json,
+                    if task.create_table { 1 } else { 0 },
+                    mode,
+                    target_table_name_case,
+                    task.batch_size as i64,
+                    task.order_index,
+                    task.last_run_at,
+                    task.created_at,
+                    task.updated_at,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn delete_transfer_task(&self, id: &str) -> Result<(), String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM transfer_tasks WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
         })
         .await
     }

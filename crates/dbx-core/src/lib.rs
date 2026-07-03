@@ -58,6 +58,7 @@ pub mod table_structure_sql;
 pub mod text_export;
 pub mod token_usage;
 pub mod transfer;
+pub mod transfer_task;
 pub mod types;
 pub mod update;
 pub mod xlsx_export;

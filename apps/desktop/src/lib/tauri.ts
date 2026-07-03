@@ -1707,6 +1707,26 @@ export interface TransferRequest {
   batchSize: number;
 }
 
+export interface TransferTask {
+  id: string;
+  name: string;
+  sourceConnectionId: string;
+  sourceDatabase: string;
+  sourceSchema: string;
+  targetConnectionId: string;
+  targetDatabase: string;
+  targetSchema: string;
+  tables: string[];
+  createTable: boolean;
+  mode: TransferMode;
+  targetTableNameCase: TransferTableNameCase;
+  batchSize: number;
+  orderIndex?: number;
+  lastRunAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TransferProgress {
   transferId: string;
   table: string;
@@ -1743,6 +1763,18 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
 
 export async function cancelTransfer(transferId: string): Promise<void> {
   return invoke("cancel_transfer", { transferId });
+}
+
+export async function loadTransferTasks(): Promise<TransferTask[]> {
+  return invoke("load_transfer_tasks");
+}
+
+export async function saveTransferTask(task: TransferTask): Promise<TransferTask> {
+  return invoke("save_transfer_task", { task });
+}
+
+export async function deleteTransferTask(id: string): Promise<void> {
+  return invoke("delete_transfer_task", { id });
 }
 
 export interface SortTablesByFkOptions {

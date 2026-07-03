@@ -104,6 +104,9 @@ export const revealPathInFileManager = forward("revealPathInFileManager");
 export const isSqliteDatabaseFile = forward("isSqliteDatabaseFile");
 export const backupSqliteDatabase = forward("backupSqliteDatabase");
 export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
+export const loadTransferTasks = forward("loadTransferTasks");
+export const saveTransferTask = forward("saveTransferTask");
+export const deleteTransferTask = forward("deleteTransferTask");
 
 // Schema
 export const listDatabases = forward("listDatabases");
@@ -483,6 +486,7 @@ export type {
   TransferProgress,
   TransferMode,
   TransferTableNameCase,
+  TransferTask,
   TableImportMode,
   TableImportStatus,
   TableImportColumnMapping,
