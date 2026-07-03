@@ -2366,6 +2366,8 @@ fn parse_scan_members(raw: RedisRawValue) -> Result<(u64, Vec<serde_json::Value>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::{
         classify_command, connection_info, decode_cluster_cursor, encode_cluster_cursor, is_redis_json_type,
         parse_cluster_slots, parse_command_argv, parse_database_count, parse_redis_endpoint, parse_scan_keys,
@@ -2376,10 +2378,56 @@ mod tests {
         RedisAuthCandidate, RedisClusterSlotRange, RedisCommandSafety, RedisNodeEndpoint, RedisRawValue,
     };
     use crate::models::connection::ConnectionConfig;
-    use redis::ConnectionAddr;
+    use redis::{aio::ConnectionLike, Cmd, ConnectionAddr, Pipeline, RedisFuture};
+
+    struct FakeRedisConnection {
+        responses: VecDeque<RedisRawValue>,
+        commands: Vec<String>,
+    }
+
+    impl FakeRedisConnection {
+        fn new(responses: Vec<RedisRawValue>) -> Self {
+            Self { responses: responses.into(), commands: Vec::new() }
+        }
+
+        fn command_count(&self, command: &str) -> usize {
+            let needle = format!("\r\n{command}\r\n");
+            self.commands.iter().filter(|packed| packed.contains(&needle)).count()
+        }
+    }
+
+    impl ConnectionLike for FakeRedisConnection {
+        fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, RedisRawValue> {
+            self.commands.push(String::from_utf8_lossy(&cmd.get_packed_command()).into_owned());
+            let response = self.responses.pop_front().unwrap_or(RedisRawValue::Nil);
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            _cmd: &'a Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> RedisFuture<'a, Vec<RedisRawValue>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+    }
 
     fn bulk(value: &str) -> RedisRawValue {
         RedisRawValue::BulkString(value.as_bytes().to_vec())
+    }
+
+    fn scan_response(cursor: &str, keys: Vec<&str>) -> RedisRawValue {
+        RedisRawValue::Array(vec![
+            bulk(cursor),
+            RedisRawValue::Array(
+                keys.into_iter().map(|key| RedisRawValue::BulkString(key.as_bytes().to_vec())).collect(),
+            ),
+        ])
     }
 
     #[test]
@@ -2476,6 +2524,40 @@ mod tests {
 
         assert_eq!(cursor, 17);
         assert_eq!(keys, vec![vec![0xAC, 0xED, 0x00, 0x05, b't'], b"plain:key".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_respects_iteration_limit_on_empty_cursor_pages() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(3001),
+            scan_response("512", vec![]),
+            scan_response("0", vec!["user:room:snapshot:200063:1"]),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "user:room:snapshot:200063:*", 1000, 1, false).await.unwrap();
+
+        assert_eq!(result.cursor, 512);
+        assert!(result.keys.is_empty());
+        assert_eq!(con.command_count("SCAN"), 1);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_can_skip_empty_cursor_pages_for_sparse_match() {
+        let key = "user:room:snapshot:200063:1";
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(3001),
+            scan_response("512", vec![]),
+            scan_response("0", vec![key]),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "user:room:snapshot:200063:*", 1000, 2, false).await.unwrap();
+
+        assert_eq!(result.cursor, 0);
+        assert_eq!(result.total_keys, 3001);
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(result.keys[0].key_display, key);
+        assert_eq!(result.keys[0].key_raw, redis_key_bytes_to_raw(key.as_bytes()));
+        assert_eq!(con.command_count("SCAN"), 2);
     }
 
     #[test]

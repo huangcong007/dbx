@@ -172,6 +172,13 @@ describe("statementRangeAtCursor", () => {
     expect(range?.sql.trim()).toBe("SELECT *\nFROM system_dept");
   });
 
+  it("keeps a semicolon-line-end cursor on the current multi-line statement", () => {
+    const sql = "SELECT *\nFROM system_dept;";
+    const gapPos = sql.indexOf(";") + 1;
+    const range = statementRangeAtCursor(sql, gapPos);
+    expect(range?.sql.trim()).toBe("SELECT *\nFROM system_dept");
+  });
+
   it("returns the next same-line statement when the cursor is inside it", () => {
     const sql = "SELECT 1;   SELECT 2;";
     const pos = indexOf(sql, "SELECT 2") + 1;
@@ -266,6 +273,22 @@ describe("statementRangeAtCursor", () => {
     expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
   });
 
+  it("keeps MySQL REPLACE function calls inside UPDATE assignments", () => {
+    const sql = `UPDATE ecm_archive_prepare_pool
+SET
+  request_json =
+    REPLACE(
+      request_json,
+      '"paperFlag":null',
+      '"paperFlag":false'
+    ),
+  process_flag = 0
+WHERE request_json LIKE '%"paperFlag":null%';`;
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "REPLACE"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+  });
+
   it("does not merge a plain MySQL DESC table statement with the next query", () => {
     const sql = "DESC users\nSELECT * FROM users;";
     expect(statementRangeAtCursor(sql, indexOf(sql, "DESC"), "mysql")?.sql.trim()).toBe("DESC users");
@@ -342,6 +365,11 @@ describe("executableStatementRanges", () => {
     expect(ranges.map((range) => range.from)).toEqual([0, sql.indexOf("DEL")]);
   });
 
+  it("keeps MySQL REPLACE INTO as an executable statement start", () => {
+    const sql = "SELECT 1\nREPLACE INTO users (id, name) VALUES (1, 'a');";
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual(["SELECT 1", "REPLACE INTO users (id, name) VALUES (1, 'a')"]);
+  });
+
   it("returns MongoDB command ranges for newline-separated shell commands", () => {
     const sql = 'use archive\ndb.users.find({ status: "open" })\n  .limit(5)';
     const ranges = executableStatementRanges(sql, "mongodb");
@@ -407,6 +435,13 @@ describe("buildExecutionCandidates", () => {
     const candidates = buildExecutionCandidates(sql, indentationPos);
     expect(candidateSummaries(candidates)).toEqual(["cursor:SELECT 2", "all:SELECT 1;\n    SELECT 2;"]);
     expect(candidateLabels(candidates)).toEqual(["currentStatement", "allStatements"]);
+  });
+
+  it("uses the current statement when the cursor is immediately after its semicolon before a blank line", () => {
+    const sql = "select 1;\n\nselect 2;";
+    const cursorAfterFirstSemicolon = sql.indexOf(";") + 1;
+    const candidates = buildExecutionCandidates(sql, cursorAfterFirstSemicolon);
+    expect(candidateSummaries(candidates)).toEqual(["cursor:select 1", "all:select 1;\n\nselect 2;"]);
   });
 
   it("dedupes when the cursor statement equals the full document", () => {

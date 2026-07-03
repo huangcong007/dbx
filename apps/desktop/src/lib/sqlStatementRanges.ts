@@ -356,6 +356,13 @@ export function statementRangeAtCursor(sql: string, cursorPos: number, databaseT
     if (pos >= statement.from && pos <= statement.to) {
       return rangeForCursorInSoftRanges(sql, softRanges, pos) ?? rangeFor(statement, sql);
     }
+    const next = statements[index + 1];
+    // A caret after a statement's semicolon still belongs to that statement
+    // until the next statement's text begins.
+    if (pos > statement.to && (!next || pos < next.from) && isCursorInSameLineDelimiterGap(sql, statement.to, pos)) {
+      return rangeForCursorInSoftRanges(sql, softRanges, pos) ?? rangeFor(statement, sql);
+    }
+
     // Cursor in indentation or inter-statement whitespace immediately before
     // the statement should still target that statement, while the returned
     // execution range remains tight around the SQL text itself.
@@ -368,7 +375,6 @@ export function statementRangeAtCursor(sql: string, cursorPos: number, databaseT
       return rangeForCursorInSoftRanges(sql, softRanges, pos) ?? rangeFor(statement, sql);
     }
 
-    const next = statements[index + 1];
     if (pos > statement.to && (!next || pos < next.hitFrom) && isCursorOnStatementLine(sql, pos, statement)) {
       return rangeForCursorInSoftRanges(sql, softRanges, pos) ?? rangeFor(statement, sql);
     }
@@ -645,11 +651,18 @@ function softStatementKeywordAt(sql: string, pos: number, databaseType?: Databas
   const match = /^[A-Za-z_][\w$]*/.exec(sql.slice(pos));
   if (!match) return null;
   const keyword = match[0].toUpperCase();
+  if (keyword === "REPLACE" && nextNonWhitespaceChar(sql, pos + match[0].length) === "(") return null;
   return softStatementStartKeywords(databaseType).has(keyword) ? keyword : null;
 }
 
 function softStatementStartKeywords(databaseType?: DatabaseType): Set<string> {
   return new Set([...COMMON_SOFT_STATEMENT_START_KEYWORDS, ...(databaseType ? (DATABASE_SOFT_STATEMENT_KEYWORDS[databaseType] ?? []) : [])]);
+}
+
+function nextNonWhitespaceChar(sql: string, pos: number): string | null {
+  let i = pos;
+  while (i < sql.length && isSqlWhitespace(sql[i])) i += 1;
+  return i < sql.length ? sql[i] : null;
 }
 
 function isExplainLikeKeyword(keyword: string | null): boolean {

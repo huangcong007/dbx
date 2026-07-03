@@ -273,7 +273,6 @@ pub async fn ai_agent_stream(
     let req_messages = request.messages;
     let req_task_contract = request.task_contract;
     let req_max_tokens = request.max_tokens;
-    let req_temperature = request.temperature;
     let is_agent_mode = body.mode == "agent";
     let tx2 = tx.clone();
     tokio::task::spawn_blocking(move || {
@@ -291,7 +290,6 @@ pub async fn ai_agent_stream(
                 },
                 &cancelled,
                 req_max_tokens,
-                req_temperature,
                 req_task_contract.as_ref(),
                 is_agent_mode,
             )

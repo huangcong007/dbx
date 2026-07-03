@@ -275,7 +275,6 @@ export interface AiCompletionRequest {
   messages: AiMessage[];
   taskContract?: AiTaskContract;
   maxTokens?: number;
-  temperature?: number;
 }
 
 export interface AiModelInfo {
@@ -1164,7 +1163,7 @@ export interface UpdateInfo {
   release_notes: string;
 }
 
-export type UpdateDownloadSource = "official" | "cnb";
+export type UpdateDownloadSource = "official" | "cnb" | "atomgit";
 
 export interface UpdateDownloadProgress {
   downloaded: number;
@@ -1363,6 +1362,11 @@ export async function redisLoadMore(connectionId: string, db: number, keyRaw: st
 
 export async function redisPubSubPublish(connectionId: string, db: number, channel: string, message: string): Promise<{ subscribers: number }> {
   return invoke("redis_pubsub_publish", { connectionId, db, channel, message });
+}
+
+export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
+  const port = await invoke<number>("redis_pubsub_server_port");
+  return new WebSocket(`ws://127.0.0.1:${port}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`);
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
