@@ -2958,6 +2958,8 @@ export default {
     showExecutionTargetPickerDescription: "When enabled, running without a selection lets you choose between the current statement and all SQL.",
     showStatementRunButtons: "Show left-side run buttons",
     showStatementRunButtonsDescription: "Show per-statement run buttons in the SQL editor gutter. Keyboard shortcuts and context menu execution still work when disabled.",
+    showCurrentStatementFrame: "Show current statement frame",
+    showCurrentStatementFrameDescription: "When enabled, the SQL editor draws an outline around the current executable statement; when disabled, the outline is hidden.",
     previewStatementRunButton: "Preview statement run button",
     wordWrap: "Word wrap",
     wordWrapDescription: "Wrap long SQL lines within the editor width",

@@ -2889,6 +2889,8 @@ export default withEnglishFallback({
     showExecutionTargetPickerDescription: "Al activarlo, ejecutar sin selección permite elegir entre la sentencia actual y todo el SQL.",
     showStatementRunButtons: "Mostrar botones de ejecución laterales",
     showStatementRunButtonsDescription: "Muestra botones para ejecutar cada sentencia en el margen del editor SQL. Los atajos de teclado y el menú contextual seguirán funcionando al desactivarlo.",
+    showCurrentStatementFrame: "Mostrar marco de la sentencia actual",
+    showCurrentStatementFrameDescription: "Al activarlo, el editor SQL dibuja un contorno alrededor de la sentencia ejecutable actual; al desactivarlo, se oculta.",
     previewStatementRunButton: "Botón de ejecución de sentencia en vista previa",
     wordWrap: "Ajuste de línea",
     wordWrapDescription: "Ajustar las líneas largas de SQL al ancho del editor",

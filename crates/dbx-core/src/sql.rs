@@ -2779,6 +2779,28 @@ SELECT 2;";
     }
 
     #[test]
+    fn mysql_routine_without_delimiter_handles_loop_end_suffixes() {
+        let sql = "\
+CREATE PROCEDURE p_loop()
+BEGIN
+  WHILE 1 = 0 DO
+    SELECT 'while; still body';
+  END WHILE;
+  REPEAT
+    SELECT 'repeat; still body';
+  UNTIL 1 = 1 END REPEAT;
+END;
+SELECT 2;";
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Mysql),
+            vec![
+                "CREATE PROCEDURE p_loop()\nBEGIN\n  WHILE 1 = 0 DO\n    SELECT 'while; still body';\n  END WHILE;\n  REPEAT\n    SELECT 'repeat; still body';\n  UNTIL 1 = 1 END REPEAT;\nEND",
+                "SELECT 2",
+            ]
+        );
+    }
+
+    #[test]
     fn mysql_regular_begin_transaction_still_splits_without_delimiter() {
         assert_eq!(
             split_sql_statements_for_database("BEGIN; INSERT INTO t VALUES (1); COMMIT;", DatabaseType::Mysql),

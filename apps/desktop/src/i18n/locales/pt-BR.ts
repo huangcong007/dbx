@@ -2888,6 +2888,8 @@ export default withEnglishFallback({
     showExecutionTargetPickerDescription: "Quando ativado, executar sem seleção permite escolher entre a instrução atual e todo o SQL.",
     showStatementRunButtons: "Mostrar botões de execução laterais",
     showStatementRunButtonsDescription: "Mostra botões para executar cada instrução na margem do editor SQL. Atalhos de teclado e execução pelo menu de contexto continuam funcionando quando desativado.",
+    showCurrentStatementFrame: "Mostrar moldura da instrução atual",
+    showCurrentStatementFrameDescription: "Quando ativado, o editor SQL desenha um contorno ao redor da instrução executável atual; quando desativado, o contorno fica oculto.",
     previewStatementRunButton: "Botão de execução de instrução na prévia",
     wordWrap: "Quebra de linha",
     wordWrapDescription: "Quebrar linhas SQL longas dentro da largura do editor",

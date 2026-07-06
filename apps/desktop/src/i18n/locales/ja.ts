@@ -2878,6 +2878,8 @@ export default withEnglishFallback({
     showExecutionTargetPickerDescription: "有効にすると、選択なしで実行するときに現在の文とすべてのSQLを一時的に選べます。",
     showStatementRunButtons: "左側の実行ボタンを表示",
     showStatementRunButtonsDescription: "SQLエディタのガターに文ごとの実行ボタンを表示します。無効にしてもキーボードショートカットとコンテキストメニューからの実行は引き続き使えます。",
+    showCurrentStatementFrame: "現在の文の枠線を表示",
+    showCurrentStatementFrameDescription: "有効にすると、SQLエディタで現在実行可能な文を枠線で示します。無効にすると枠線を表示しません。",
     previewStatementRunButton: "文の実行ボタンのプレビュー",
     wordWrap: "折り返し",
     wordWrapDescription: "長いSQL行をエディタ幅内で折り返します",

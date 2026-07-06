@@ -271,6 +271,14 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
       continue;
     }
 
+    if (supportsSqlServerGoCommands(databaseType) && isAtLineStart(sql, i) && isSqlServerGoLine(sql, i)) {
+      const lineEnd = findLineEnd(sql, i);
+      flush(i);
+      i = nextLineStart(sql, lineEnd);
+      statementHitStart = i;
+      continue;
+    }
+
     if (ch === "'") {
       markContent(i);
       state = "single";
@@ -296,7 +304,7 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
       continue;
     }
     // Postgres dollar quoting: $tag$ ... $tag$ (tag may be empty, i.e. $$)
-    if (ch === "$") {
+    if (!customDelimiter && ch === "$") {
       const tagMatch = /^\$[A-Za-z_0-9]*\$/.exec(sql.slice(i));
       if (tagMatch) {
         markContent(i);
@@ -1386,6 +1394,15 @@ function isSlashLine(sql: string, pos: number): boolean {
   return sql.slice(pos, lineEnd).trim() === "/";
 }
 
+function supportsSqlServerGoCommands(databaseType?: DatabaseType): boolean {
+  return databaseType === "sqlserver";
+}
+
+function isSqlServerGoLine(sql: string, pos: number): boolean {
+  const lineEnd = findLineEnd(sql, pos);
+  return /^go(?:\s+\d+)?$/i.test(sql.slice(pos, lineEnd).trim());
+}
+
 function startsDelimiterCommand(sql: string, pos: number): boolean {
   const prefix = sql.slice(pos, pos + 9);
   return prefix.toLowerCase() === "delimiter" && (sql[pos + 9] === " " || sql[pos + 9] === "\t");
@@ -1468,9 +1485,15 @@ export function executableStatementRanges(sql: string, databaseType?: DatabaseTy
   return splitSqlStatementRanges(sql, databaseType).flatMap((statement) => splitStatementRangeAtSoftStarts(sql, statement, databaseType).map((range) => rangeFor(range, sql)));
 }
 
+export function currentExecutableStatementRange(sql: string, cursorPos: number, databaseType?: DatabaseType): SqlTextRange | null {
+  if (databaseType === "redis") return redisCommandRangeAtCursor(sql, cursorPos);
+  if (databaseType === "mongodb") return null;
+  return statementRangeAtCursor(sql, cursorPos, databaseType);
+}
+
 export function buildExecutionCandidates(sql: string, cursorPos: number, databaseType?: DatabaseType): SqlExecutionCandidate[] {
   const full = fullSqlRange(sql);
-  const cursorStatement = databaseType === "redis" ? redisCommandRangeAtCursor(sql, cursorPos) : statementRangeAtCursor(sql, cursorPos, databaseType);
+  const cursorStatement = currentExecutableStatementRange(sql, cursorPos, databaseType);
 
   if (!full && !cursorStatement) return [];
   if (!full) {
