@@ -2065,6 +2065,8 @@ export default withEnglishFallback({
     tableNameCaseLower: "Convertir a minúsculas",
     tableNameCaseUpper: "Convertir a mayúsculas",
     batchSize: "Tamaño de lote",
+    commitInterval: "Intervalo de commit",
+    parallelTables: "Tablas paralelas",
     skipCount: "Omitir conteo de filas",
     start: "Iniciar transferencia",
     cancel: "Cancelar",

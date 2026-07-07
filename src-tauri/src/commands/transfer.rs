@@ -102,97 +102,88 @@ pub async fn start_transfer(
             }
         }
 
-        let mut failed_tables: Vec<String> = Vec::new();
-        for (i, table) in sorted_tables.iter().enumerate() {
-            if dbx_core::transfer::is_cancelled(&transfer_id).await {
-                emit_progress(
-                    &app,
-                    TransferProgress {
-                        transfer_id: transfer_id.clone(),
-                        table: table.clone(),
-                        table_index: i,
-                        total_tables,
-                        rows_transferred: 0,
-                        total_rows: None,
-                        status: TransferStatus::Cancelled,
-                        error: None,
-                    },
-                );
-                dbx_core::transfer::clear_cancelled(&transfer_id).await;
-                return;
-            }
-
-            log::info!("[transfer] table {}/{}: {}", i + 1, total_tables, table);
-
-            let mut last_rows_transferred = 0_u64;
-            let mut last_total_rows = None;
-
-            match dbx_core::transfer::transfer_table(
-                &state,
-                &request,
-                table,
-                i,
-                &source_db_type,
-                &target_db_type,
-                &source_pool_key,
-                &target_pool_key,
-                |progress| {
-                    last_rows_transferred = progress.rows_transferred;
-                    last_total_rows = progress.total_rows;
-                    emit_progress(&app, progress);
-                },
-            )
-            .await
+        let failed_tables: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app_for_progress = app.clone();
+        let transfer_id_for_progress = transfer_id.clone();
+        let sorted_tables_for_done = sorted_tables.clone();
+        dbx_core::transfer::transfer_tables(
+            state.clone(),
+            &request,
+            &sorted_tables,
+            &source_db_type,
+            &target_db_type,
+            &source_pool_key,
+            &target_pool_key,
+            move |progress| emit_progress(&app_for_progress, progress),
             {
-                Ok(rows) => {
-                    emit_progress(
-                        &app,
-                        TransferProgress {
-                            transfer_id: transfer_id.clone(),
-                            table: table.clone(),
-                            table_index: i,
-                            total_tables,
-                            rows_transferred: rows,
-                            total_rows: last_total_rows.or(Some(rows)),
-                            status: TransferStatus::TableDone,
-                            error: None,
-                        },
-                    );
-                }
-                Err(e) => {
-                    if e == "Cancelled" {
-                        emit_progress(
-                            &app,
-                            TransferProgress {
-                                transfer_id: transfer_id.clone(),
-                                table: table.clone(),
-                                table_index: i,
-                                total_tables,
-                                rows_transferred: 0,
-                                total_rows: None,
-                                status: TransferStatus::Cancelled,
-                                error: None,
-                            },
-                        );
-                        dbx_core::transfer::clear_cancelled(&transfer_id).await;
-                        return;
+                let app = app.clone();
+                let transfer_id = transfer_id.clone();
+                let failed_tables = failed_tables.clone();
+                let sorted_tables = sorted_tables_for_done.clone();
+                move |table: &str, result: dbx_core::transfer::TableTransferResult| {
+                    let i = sorted_tables.iter().position(|t| t == table).unwrap_or(0);
+                    match result {
+                        Ok(rows) => {
+                            emit_progress(
+                                &app,
+                                TransferProgress {
+                                    transfer_id: transfer_id.clone(),
+                                    table: table.to_string(),
+                                    table_index: i,
+                                    total_tables,
+                                    rows_transferred: rows,
+                                    total_rows: Some(rows),
+                                    status: TransferStatus::TableDone,
+                                    error: None,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            if e == "Cancelled" {
+                                emit_progress(
+                                    &app,
+                                    TransferProgress {
+                                        transfer_id: transfer_id.clone(),
+                                        table: table.to_string(),
+                                        table_index: i,
+                                        total_tables,
+                                        rows_transferred: 0,
+                                        total_rows: None,
+                                        status: TransferStatus::Cancelled,
+                                        error: None,
+                                    },
+                                );
+                                return;
+                            }
+                            if let Ok(mut ft) = failed_tables.lock() {
+                                ft.push(table.to_string());
+                            }
+                            emit_progress(
+                                &app,
+                                TransferProgress {
+                                    transfer_id: transfer_id.clone(),
+                                    table: table.to_string(),
+                                    table_index: i,
+                                    total_tables,
+                                    rows_transferred: 0,
+                                    total_rows: None,
+                                    status: TransferStatus::Error,
+                                    error: Some(e),
+                                },
+                            );
+                        }
                     }
-                    failed_tables.push(table.clone());
-                    emit_progress(
-                        &app,
-                        TransferProgress {
-                            transfer_id: transfer_id.clone(),
-                            table: table.clone(),
-                            table_index: i,
-                            total_tables,
-                            rows_transferred: last_rows_transferred,
-                            total_rows: last_total_rows,
-                            status: TransferStatus::Error,
-                            error: Some(e),
-                        },
-                    );
                 }
-            }
+            },
+        )
+        .await;
+
+        // 检测取消：transfer_tables 内部各表循环会检查 is_cancelled，但取消后不会主动 return，
+        // 这里统一判断是否已取消以跳过后续 schema objects。
+        if dbx_core::transfer::is_cancelled(&transfer_id_for_progress).await {
+            dbx_core::transfer::clear_cancelled(&transfer_id_for_progress).await;
+            return;
         }
 
         if matches!(source_db_type, dbx_core::models::connection::DatabaseType::Postgres)
@@ -226,7 +217,9 @@ pub async fn start_transfer(
                     return;
                 }
                 Err(e) => {
-                    failed_tables.push("schema objects".to_string());
+                    if let Ok(mut ft) = failed_tables.lock() {
+                        ft.push("schema objects".to_string());
+                    }
                     emit_progress(
                         &app,
                         TransferProgress {
@@ -244,6 +237,23 @@ pub async fn start_transfer(
             }
         }
 
+        let failed_summary = failed_tables
+            .lock()
+            .map(|ft| {
+                if ft.is_empty() {
+                    (TransferStatus::Done, None)
+                } else {
+                    (
+                        TransferStatus::Error,
+                        Some(format!(
+                            "{} table(s) failed: {}",
+                            ft.len(),
+                            ft.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                        )),
+                    )
+                }
+            })
+            .unwrap_or((TransferStatus::Error, Some("failed to read failed_tables".to_string())));
         emit_progress(
             &app,
             TransferProgress {
@@ -253,16 +263,8 @@ pub async fn start_transfer(
                 total_tables,
                 rows_transferred: 0,
                 total_rows: None,
-                status: if failed_tables.is_empty() { TransferStatus::Done } else { TransferStatus::Error },
-                error: if failed_tables.is_empty() {
-                    None
-                } else {
-                    Some(format!(
-                        "{} table(s) failed: {}",
-                        failed_tables.len(),
-                        failed_tables.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
-                    ))
-                },
+                status: failed_summary.0,
+                error: failed_summary.1,
             },
         );
         dbx_core::transfer::clear_cancelled(&transfer_id).await;

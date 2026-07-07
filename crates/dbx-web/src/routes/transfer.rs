@@ -94,85 +94,112 @@ pub async fn start_transfer(
             log::warn!("[transfer] failed to sort tables by FK dependency, using original order: {e}");
             tables
         });
-        let mut failed_tables: Vec<String> = Vec::new();
-        for (i, table) in tables.iter().enumerate() {
-            if transfer::is_cancelled(&req.transfer_id).await {
-                let progress = transfer::TransferProgress {
-                    transfer_id: req.transfer_id.clone(),
-                    table: table.clone(),
-                    table_index: i,
-                    total_tables: tables.len(),
-                    rows_transferred: 0,
-                    total_rows: None,
-                    status: TransferStatus::Cancelled,
-                    error: None,
-                };
+        let failed_tables: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let total_tables = tables.len();
+        let tables_for_done = tables.clone();
+        let tx_for_progress = tx.clone();
+        let req_id = req.transfer_id.clone();
+        transfer::transfer_tables(
+            app.clone(),
+            &req,
+            &tables,
+            &source_db_type,
+            &target_db_type,
+            &source_pool_key,
+            &target_pool_key,
+            move |progress| {
                 if let Ok(json) = serde_json::to_string(&progress) {
-                    let _ = tx.send(json);
+                    let _ = tx_for_progress.send(json);
                 }
-                transfer::clear_cancelled(&req.transfer_id).await;
-                state_clone.remove_sse_channel(&req.transfer_id).await;
-                return;
-            }
+            },
+            {
+                let tx = tx.clone();
+                let req_id = req_id.clone();
+                let failed_tables = failed_tables.clone();
+                let tables = tables_for_done.clone();
+                move |table: &str, result: transfer::TableTransferResult| {
+                    let i = tables.iter().position(|t| t == table).unwrap_or(0);
+                    match result {
+                        Ok(rows) => {
+                            let progress = transfer::TransferProgress {
+                                transfer_id: req_id.clone(),
+                                table: table.to_string(),
+                                table_index: i,
+                                total_tables,
+                                rows_transferred: rows,
+                                total_rows: Some(rows),
+                                status: TransferStatus::TableDone,
+                                error: None,
+                            };
+                            if let Ok(json) = serde_json::to_string(&progress) {
+                                let _ = tx.send(json);
+                            }
+                        }
+                        Err(e) => {
+                            if e == "Cancelled" {
+                                let progress = transfer::TransferProgress {
+                                    transfer_id: req_id.clone(),
+                                    table: table.to_string(),
+                                    table_index: i,
+                                    total_tables,
+                                    rows_transferred: 0,
+                                    total_rows: None,
+                                    status: TransferStatus::Cancelled,
+                                    error: None,
+                                };
+                                if let Ok(json) = serde_json::to_string(&progress) {
+                                    let _ = tx.send(json);
+                                }
+                                return;
+                            }
+                            if let Ok(mut ft) = failed_tables.lock() {
+                                ft.push(table.to_string());
+                            }
+                            let progress = transfer::TransferProgress {
+                                transfer_id: req_id.clone(),
+                                table: table.to_string(),
+                                table_index: i,
+                                total_tables,
+                                rows_transferred: 0,
+                                total_rows: None,
+                                status: TransferStatus::Error,
+                                error: Some(e),
+                            };
+                            if let Ok(json) = serde_json::to_string(&progress) {
+                                let _ = tx.send(json);
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .await;
 
-            let tx_clone = tx.clone();
-            let mut last_rows_transferred = 0_u64;
-            let mut last_total_rows = None;
-            let result = transfer::transfer_table(
-                &app,
-                &req,
-                table,
-                i,
-                &source_db_type,
-                &target_db_type,
-                &source_pool_key,
-                &target_pool_key,
-                |progress| {
-                    last_rows_transferred = progress.rows_transferred;
-                    last_total_rows = progress.total_rows;
-                    if let Ok(json) = serde_json::to_string(&progress) {
-                        let _ = tx_clone.send(json);
-                    }
-                },
-            )
-            .await;
-
-            match result {
-                Ok(_) => {
-                    let progress = transfer::TransferProgress {
-                        transfer_id: req.transfer_id.clone(),
-                        table: table.clone(),
-                        table_index: i,
-                        total_tables: tables.len(),
-                        rows_transferred: last_rows_transferred,
-                        total_rows: last_total_rows.or(Some(last_rows_transferred)),
-                        status: TransferStatus::TableDone,
-                        error: None,
-                    };
-                    if let Ok(json) = serde_json::to_string(&progress) {
-                        let _ = tx.send(json);
-                    }
-                }
-                Err(e) => {
-                    failed_tables.push(table.clone());
-                    let progress = transfer::TransferProgress {
-                        transfer_id: req.transfer_id.clone(),
-                        table: table.clone(),
-                        table_index: i,
-                        total_tables: tables.len(),
-                        rows_transferred: last_rows_transferred,
-                        total_rows: last_total_rows,
-                        status: TransferStatus::Error,
-                        error: Some(e),
-                    };
-                    if let Ok(json) = serde_json::to_string(&progress) {
-                        let _ = tx.send(json);
-                    }
-                }
-            }
+        if transfer::is_cancelled(&req.transfer_id).await {
+            transfer::clear_cancelled(&req.transfer_id).await;
+            state_clone.remove_sse_channel(&req.transfer_id).await;
+            return;
         }
 
         // Send done
+        let failed_summary = failed_tables
+            .lock()
+            .map(|ft| {
+                if ft.is_empty() {
+                    (TransferStatus::Done, None)
+                } else {
+                    (
+                        TransferStatus::Error,
+                        Some(format!(
+                            "{} table(s) failed: {}",
+                            ft.len(),
+                            ft.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                        )),
+                    )
+                }
+            })
+            .unwrap_or((TransferStatus::Error, Some("failed to read failed_tables".to_string())));
         let done = transfer::TransferProgress {
             transfer_id: req.transfer_id.clone(),
             table: String::new(),
@@ -180,16 +207,8 @@ pub async fn start_transfer(
             total_tables: tables.len(),
             rows_transferred: 0,
             total_rows: None,
-            status: if failed_tables.is_empty() { TransferStatus::Done } else { TransferStatus::Error },
-            error: if failed_tables.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} table(s) failed: {}",
-                    failed_tables.len(),
-                    failed_tables.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
-                ))
-            },
+            status: failed_summary.0,
+            error: failed_summary.1,
         };
         if let Ok(json) = serde_json::to_string(&done) {
             let _ = tx.send(json);

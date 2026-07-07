@@ -2064,6 +2064,8 @@ export default {
     tableNameCaseLower: "Lowercase",
     tableNameCaseUpper: "Uppercase",
     batchSize: "Batch size",
+    commitInterval: "Commit interval",
+    parallelTables: "Parallel tables",
     skipCount: "Skip row count",
     start: "Start Transfer",
     cancel: "Cancel",

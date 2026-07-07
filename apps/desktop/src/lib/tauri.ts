@@ -1711,6 +1711,7 @@ export interface TransferRequest {
   batchSize: number;
   skipCount?: boolean;
   commitIntervalBatches?: number;
+  parallelTables?: number;
 }
 
 export interface TransferTask {
@@ -1729,6 +1730,7 @@ export interface TransferTask {
   batchSize: number;
   skipCount?: boolean;
   commitIntervalBatches?: number;
+  parallelTables?: number;
   orderIndex?: number;
   lastRunAt?: string | null;
   createdAt: string;

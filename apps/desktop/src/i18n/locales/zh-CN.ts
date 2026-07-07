@@ -2066,6 +2066,8 @@ export default withEnglishFallback({
     tableNameCaseLower: "转为小写",
     tableNameCaseUpper: "转为大写",
     batchSize: "每批行数",
+    commitInterval: "提交间隔",
+    parallelTables: "并发表数",
     skipCount: "跳过行数统计",
     start: "开始传输",
     cancel: "取消",

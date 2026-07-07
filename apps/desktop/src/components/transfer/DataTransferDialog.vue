@@ -68,7 +68,9 @@ const targetSchema = ref("");
 const createTable = ref(true);
 const transferMode = ref<TransferMode>("append");
 const targetTableNameCase = ref<TransferTableNameCase>("preserve");
-const batchSize = ref(5000);
+const batchSize = ref(10000);
+const commitInterval = ref(50);
+const parallelTables = ref(1);
 const skipCount = ref(false);
 const isSubmitting = ref(false);
 
@@ -110,6 +112,8 @@ function buildTaskSummary(task: TransferTask) {
     `${t("transfer.transferMode")}: ${modeLabel(task.mode)}`,
     `${t("transfer.createTable")}: ${task.createTable ? t("transfer.yes") : t("transfer.no")}`,
     `${t("transfer.batchSize")}: ${task.batchSize}`,
+    `${t("transfer.commitInterval")}: ${task.commitIntervalBatches ?? 50}`,
+    `${t("transfer.parallelTables")}: ${task.parallelTables ?? 1}`,
     `${t("transfer.skipCount")}: ${task.skipCount ? t("transfer.yes") : t("transfer.no")}`,
   ].join("\n");
 }
@@ -129,6 +133,8 @@ function currentTaskInput() {
     mode: transferMode.value,
     targetTableNameCase: targetTableNameCase.value,
     batchSize: batchSize.value,
+    commitIntervalBatches: commitInterval.value,
+    parallelTables: parallelTables.value,
     skipCount: skipCount.value,
   };
 }
@@ -149,6 +155,8 @@ function buildTransferRequestFromForm(transferId = uuid()): api.TransferRequest 
     mode: transferMode.value,
     targetTableNameCase: targetTableNameCase.value,
     batchSize: batchSize.value,
+    commitIntervalBatches: commitInterval.value,
+    parallelTables: parallelTables.value,
     skipCount: skipCount.value,
   };
 }
@@ -167,6 +175,8 @@ function buildTransferRequestFromTask(task: TransferTask, transferId = uuid()): 
     mode: task.mode,
     targetTableNameCase: task.targetTableNameCase,
     batchSize: task.batchSize,
+    commitIntervalBatches: task.commitIntervalBatches ?? 50,
+    parallelTables: task.parallelTables ?? 1,
     skipCount: task.skipCount,
   };
 }
@@ -362,7 +372,9 @@ function resetState() {
   createTable.value = true;
   transferMode.value = "append";
   targetTableNameCase.value = "preserve";
-  batchSize.value = 5000;
+  batchSize.value = 10000;
+  commitInterval.value = 50;
+  parallelTables.value = 1;
   skipCount.value = false;
   isSubmitting.value = false;
   pendingTableSelection.value = null;
@@ -378,6 +390,8 @@ async function loadTaskIntoForm(task: TransferTask) {
   transferMode.value = task.mode;
   targetTableNameCase.value = task.targetTableNameCase;
   batchSize.value = task.batchSize;
+  commitInterval.value = task.commitIntervalBatches ?? 50;
+  parallelTables.value = task.parallelTables ?? 1;
   skipCount.value = task.skipCount ?? false;
   pendingTableSelection.value = [...task.tables];
   selectedTables.value = new Set(task.tables);
@@ -755,7 +769,15 @@ function formatLastRunAt(value?: string | null) {
             </div>
             <div class="flex items-center gap-3">
               <Label class="text-xs shrink-0">{{ t("transfer.batchSize") }}</Label>
-              <Input v-model.number="batchSize" type="number" min="100" max="20000" step="100" class="h-7 text-xs w-24" />
+              <Input v-model.number="batchSize" type="number" min="100" max="50000" step="100" class="h-7 text-xs w-24" />
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="text-xs shrink-0">{{ t("transfer.commitInterval") }}</Label>
+              <Input v-model.number="commitInterval" type="number" min="0" max="500" step="10" class="h-7 text-xs w-24" />
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="text-xs shrink-0">{{ t("transfer.parallelTables") }}</Label>
+              <Input v-model.number="parallelTables" type="number" min="1" max="16" step="1" class="h-7 text-xs w-24" />
             </div>
             <div class="flex items-center gap-2 cursor-pointer text-xs" @click="skipCount = !skipCount">
               <CheckSquare v-if="skipCount" class="w-3.5 h-3.5 text-primary shrink-0" />

@@ -17,7 +17,9 @@ use crate::sql_dialect::{qualified_transfer_table, quote_transfer_identifier};
 static CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
 
-const MAX_TRANSFER_WRITE_SQL_BYTES: usize = 512 * 1024;
+// 单条 INSERT 语句的最大字节数。MySQL 默认 max_allowed_packet=64MB，
+// 8MB 在保留充足余量的同时显著减少往返次数（相比原 512KB 减少 16x）。
+const MAX_TRANSFER_WRITE_SQL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SQLSERVER_INSERT_ROWS: usize = 1000;
 const MAX_ORACLE_MERGE_ROWS: usize = 500;
 
@@ -69,6 +71,13 @@ pub struct TransferRequest {
     /// multi-statement transactions (MySQL/PG/SQLite/DuckDB families).
     #[serde(default)]
     pub commit_interval_batches: Option<usize>,
+    /// Maximum number of tables to transfer concurrently. `None` or `1` keeps
+    /// the legacy sequential behaviour. Values > 1 enable table-level parallelism:
+    /// up to N tables will be transferred at the same time. Useful when the
+    /// source and target are separate physical instances and per-table IO is
+    /// not the bottleneck.
+    #[serde(default)]
+    pub parallel_tables: Option<usize>,
 }
 
 impl TransferRequest {
@@ -835,81 +844,107 @@ pub fn escape_value(val: &serde_json::Value, db_type: &DatabaseType) -> String {
 }
 
 pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, column_type: Option<&str>) -> String {
+    let mut buf = String::with_capacity(16);
+    escape_value_into(val, db_type, column_type, &mut buf);
+    buf
+}
+
+/// 直接把转义后的值 append 到 `out`，避免中间 String 分配。
+/// 与 `escape_value_typed` 语义等价，但零中间分配。
+pub fn escape_value_into(val: &serde_json::Value, db_type: &DatabaseType, column_type: Option<&str>, out: &mut String) {
     match val {
-        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Null => out.push_str("NULL"),
         serde_json::Value::Bool(b) => match db_type {
             DatabaseType::Mysql
             | DatabaseType::Sqlite
             | DatabaseType::DuckDb
             | DatabaseType::Doris
             | DatabaseType::StarRocks => {
+                let is_bit = column_type.is_some_and(is_mysql_bit_type);
                 if *b {
-                    if column_type.is_some_and(is_mysql_bit_type) {
-                        "b'1'".to_string()
+                    if is_bit {
+                        out.push_str("b'1'");
                     } else {
-                        "1".to_string()
+                        out.push('1');
                     }
+                } else if is_bit {
+                    out.push_str("b'0'");
                 } else {
-                    if column_type.is_some_and(is_mysql_bit_type) {
-                        "b'0'".to_string()
-                    } else {
-                        "0".to_string()
-                    }
+                    out.push('0');
                 }
             }
-            DatabaseType::SqlServer => {
-                if *b {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                }
-            }
-            _ => {
-                if *b {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
-                }
-            }
+            DatabaseType::SqlServer => out.push(if *b { '1' } else { '0' }),
+            _ => out.push_str(if *b { "TRUE" } else { "FALSE" }),
         },
         serde_json::Value::Number(n) => match db_type {
             DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => {
                 if column_type.is_some_and(is_mysql_bit_type) {
-                    format!("b'{}'", n)
+                    out.push_str("b'");
+                    out.push_str(&n.to_string());
+                    out.push('\'');
                 } else {
-                    n.to_string()
+                    out.push_str(&n.to_string());
                 }
             }
-            _ => n.to_string(),
+            _ => out.push_str(&n.to_string()),
         },
         serde_json::Value::String(s) => {
             if let Some(binary_literal) = format_postgres_binary_sql_literal(s, db_type, column_type) {
-                return binary_literal;
+                out.push_str(&binary_literal);
+                return;
             }
 
             let literal = format_literal_string(s, db_type, column_type);
-            let escaped = if is_postgres_family_target(db_type) {
-                literal.replace('\'', "''")
+            // 写入包裹引号和转义后的内容，直接 append，避免两次 String::replace 分配
+            let is_pg = is_postgres_family_target(db_type);
+            let is_bit = matches!(db_type, DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks)
+                && column_type.is_some_and(is_mysql_bit_type);
+            if is_bit {
+                out.push_str("b'");
+            } else if matches!(db_type, DatabaseType::SqlServer) {
+                out.push_str("N'");
             } else {
-                literal.replace('\\', "\\\\").replace('\'', "''")
-            };
-            match db_type {
-                DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks
-                    if column_type.is_some_and(is_mysql_bit_type) =>
-                {
-                    format!("b'{escaped}'")
-                }
-                DatabaseType::SqlServer => format!("N'{escaped}'"),
-                _ => format!("'{escaped}'"),
+                out.push('\'');
             }
+            // 转义写入：PG 仅替换 '，其他替换 \ 和 '
+            escape_string_into(&literal, is_pg, out);
+            out.push('\'');
         }
         serde_json::Value::Array(arr) => match db_type {
-            DatabaseType::ClickHouse | DatabaseType::Databend => format_ch_array_sql_literal(arr),
-            _ => format_pg_array_sql_literal(arr),
+            DatabaseType::ClickHouse | DatabaseType::Databend => {
+                out.push_str(&format_ch_array_sql_literal(arr));
+            }
+            _ => out.push_str(&format_pg_array_sql_literal(arr)),
         },
         _ => {
             let s = val.to_string();
-            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+            out.push('\'');
+            escape_string_into(&s, false, out);
+            out.push('\'');
+        }
+    }
+}
+
+/// 把 `value` 的内容转义后 append 到 `out`。
+/// `postgres_style = true` 仅转义单引号；`false` 同时转义反斜杠和单引号。
+fn escape_string_into(value: &str, postgres_style: bool, out: &mut String) {
+    if postgres_style {
+        for ch in value.chars() {
+            if ch == '\'' {
+                out.push_str("''");
+            } else {
+                out.push(ch);
+            }
+        }
+    } else {
+        for ch in value.chars() {
+            if ch == '\\' {
+                out.push_str("\\\\");
+            } else if ch == '\'' {
+                out.push_str("''");
+            } else {
+                out.push(ch);
+            }
         }
     }
 }
@@ -1542,11 +1577,16 @@ fn value_rows_sql(
 ) -> Vec<String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut vals = Vec::with_capacity(row.len());
+        let mut buf = String::with_capacity(row.len() * 8);
+        buf.push('(');
         for (index, v) in row.iter().enumerate() {
-            vals.push(escape_value_typed(v, db_type, column_types.get(index).and_then(|value| value.as_deref())));
+            if index > 0 {
+                buf.push_str(", ");
+            }
+            escape_value_into(v, db_type, column_types.get(index).and_then(|value| value.as_deref()), &mut buf);
         }
-        out.push(format!("({})", vals.join(", ")));
+        buf.push(')');
+        out.push(buf);
     }
     out
 }
@@ -3407,7 +3447,7 @@ where
 {
     let total_tables = request.tables.len();
     let target_table = request.target_table_name(table);
-    let batch_size = if request.batch_size == 0 { 5000 } else { request.batch_size };
+    let batch_size = if request.batch_size == 0 { 10000 } else { request.batch_size };
     let mut offset: u64 = 0;
     let mut total_transferred: u64 = 0;
     let mut total_rows = None;
@@ -3712,9 +3752,9 @@ where
         return Err(format!("No writable columns found for table {table}"));
     }
 
-    let col_names: Vec<String> = writable_columns.iter().map(|c| c.name.clone()).collect();
-    let col_types: Vec<Option<String>> = writable_columns.iter().map(|c| Some(c.data_type.clone())).collect();
-    let primary_key_columns: Vec<String> =
+    let mut col_names: Vec<String> = writable_columns.iter().map(|c| c.name.clone()).collect();
+    let mut col_types: Vec<Option<String>> = writable_columns.iter().map(|c| Some(c.data_type.clone())).collect();
+    let mut primary_key_columns: Vec<String> =
         writable_columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect();
     log::info!("[transfer] {} has {} columns, counting rows...", table, columns.len());
 
@@ -3748,6 +3788,61 @@ where
     .await
     .map(|tables| !tables.is_empty())
     .unwrap_or(false);
+
+    // 目标表已存在时，将源表列与目标表列做交集，避免 INSERT 出现 Unknown column 错误
+    // （如：源表新增了目标表没有的列；或同源同目标 DDL 复用路径未感知目标表实际结构）
+    if target_table_preexisting {
+        let target_columns = get_columns_for_transfer(
+            state,
+            target_pool_key,
+            &request.target_connection_id,
+            &request.target_database,
+            &request.target_schema,
+            &target_table,
+        )
+        .await
+        .unwrap_or_default();
+        if !target_columns.is_empty() {
+            let target_set: std::collections::HashSet<String> =
+                target_columns.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+            let original_count = col_names.len();
+            let mut kept_names = Vec::new();
+            let mut kept_types = Vec::new();
+            let mut kept_pks = Vec::new();
+            let mut skipped_names = Vec::new();
+            for (name, ty) in col_names.into_iter().zip(col_types.into_iter()) {
+                if target_set.contains(&name.to_ascii_lowercase()) {
+                    if primary_key_columns.iter().any(|pk| pk.eq_ignore_ascii_case(&name)) {
+                        kept_pks.push(name.clone());
+                    }
+                    kept_names.push(name);
+                    kept_types.push(ty);
+                } else {
+                    skipped_names.push(name);
+                }
+            }
+            if !skipped_names.is_empty() {
+                log::warn!(
+                    "[transfer] {} skipped {} columns not present in target table: {}",
+                    table,
+                    skipped_names.len(),
+                    skipped_names.join(", ")
+                );
+            }
+            if kept_names.is_empty() {
+                return Err(format!("No common columns between source and target table {table}"));
+            }
+            log::info!(
+                "[transfer] {} narrowed from {} to {} columns matching target table",
+                table,
+                original_count,
+                kept_names.len()
+            );
+            col_names = kept_names;
+            col_types = kept_types;
+            primary_key_columns = kept_pks;
+        }
+    }
 
     let source_indexes =
         if request.create_table && pg_compat_transfer && preserves_target_table_name && !target_table_preexisting {
@@ -3940,7 +4035,7 @@ where
     };
 
     // Transfer data in batches
-    let batch_size = if request.batch_size == 0 { 5000 } else { request.batch_size };
+    let batch_size = if request.batch_size == 0 { 10000 } else { request.batch_size };
     let mut offset: u64 = 0;
     let mut total_transferred: u64 = 0;
 
@@ -3964,7 +4059,7 @@ where
     // by default). This can improve write throughput 5-10x on InnoDB. We hold a
     // dedicated connection because START TRANSACTION / COMMIT must execute on the
     // same connection — execute_on_pool acquires a fresh conn per call.
-    let commit_interval = request.commit_interval_batches.unwrap_or(10);
+    let commit_interval = request.commit_interval_batches.unwrap_or(50);
     let use_transaction = commit_interval > 0 && matches!(target_db_type, DatabaseType::Mysql);
 
     let mut tx_conn: Option<mysql_async::Conn> = if use_transaction {
@@ -4177,6 +4272,114 @@ where
     }
 
     Ok(total_transferred)
+}
+
+/// 单表传输结果（成功传输行数，或失败错误信息）。
+pub type TableTransferResult = Result<u64, String>;
+
+/// 传输多张表的编排入口。根据 `request.parallel_tables` 选择串行或并行模式。
+///
+/// - `parallel_tables` 为 `None`/`1` → 串行：按 `tables` 顺序逐张传输，任一表失败不中断后续。
+/// - `parallel_tables` > `1` → 并行：用 `buffered(N)` 同时传输最多 N 张表。
+///
+/// `tables` 应已按 FK 依赖排序（parents_first）。并行模式下，由于表已按依赖层级排序，
+/// 同一批次内的表通常无相互引用，FK 约束不会被违反；Overwrite/Append 模式下目标表
+/// 已存在，并行 INSERT 安全。
+///
+/// `progress_callback` 会被每张表的进度事件调用，包括 Running/TableDone/Error。
+/// `table_done_callback` 在每张表完成（无论成功或失败）后调用，参数为 (table_name, result)。
+#[allow(clippy::too_many_arguments)]
+pub async fn transfer_tables<F, P>(
+    state: std::sync::Arc<AppState>,
+    request: &TransferRequest,
+    tables: &[String],
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+    source_pool_key: &str,
+    target_pool_key: &str,
+    progress_callback: F,
+    table_done_callback: P,
+) where
+    F: Fn(TransferProgress) + Send + Sync + 'static,
+    P: Fn(&str, TableTransferResult) + Send + Sync + 'static,
+{
+    let parallel = request.parallel_tables.unwrap_or(1).max(1);
+
+    if parallel <= 1 {
+        // 串行模式：保持与历史行为完全一致
+        for (i, table) in tables.iter().enumerate() {
+            if is_cancelled(&request.transfer_id).await {
+                return;
+            }
+            let result = transfer_table(
+                &state,
+                request,
+                table,
+                i,
+                source_db_type,
+                target_db_type,
+                source_pool_key,
+                target_pool_key,
+                |p| progress_callback(p),
+            )
+            .await;
+            table_done_callback(table, result);
+        }
+        return;
+    }
+
+    // 并行模式：用 JoinSet 并发传输，最多同时跑 parallel 个表。
+    use tokio::task::JoinSet;
+    let progress_cb = std::sync::Arc::new(progress_callback);
+    let done_cb = std::sync::Arc::new(table_done_callback);
+    let source_db_type = source_db_type.clone();
+    let target_db_type = target_db_type.clone();
+    let source_pool_key = source_pool_key.to_string();
+    let target_pool_key = target_pool_key.to_string();
+
+    let mut join_set: JoinSet<()> = JoinSet::new();
+    for (i, table) in tables.iter().enumerate() {
+        // 控制并发度：如果已派发的任务数达到 parallel，等待一个完成再继续
+        while join_set.len() >= parallel {
+            if join_set.join_next().await.is_some() {
+                // 完成回调已在任务内部触发，这里只需腾出槽位
+            }
+        }
+        if is_cancelled(&request.transfer_id).await {
+            break;
+        }
+        let progress_cb = progress_cb.clone();
+        let done_cb = done_cb.clone();
+        let table = table.clone();
+        let request = request.clone();
+        let state = state.clone();
+        let source_db_type = source_db_type.clone();
+        let target_db_type = target_db_type.clone();
+        let source_pool_key = source_pool_key.clone();
+        let target_pool_key = target_pool_key.clone();
+        join_set.spawn(async move {
+            if is_cancelled(&request.transfer_id).await {
+                let result: TableTransferResult = Err("Cancelled".to_string());
+                done_cb(&table, result);
+                return;
+            }
+            let result = transfer_table(
+                &state,
+                &request,
+                &table,
+                i,
+                &source_db_type,
+                &target_db_type,
+                &source_pool_key,
+                &target_pool_key,
+                move |p| progress_cb(p),
+            )
+            .await;
+            done_cb(&table, result);
+        });
+    }
+    // 等待所有剩余任务完成
+    while join_set.join_next().await.is_some() {}
 }
 
 pub async fn transfer_postgres_schema_dependencies<F>(

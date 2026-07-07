@@ -18,6 +18,8 @@ export interface SaveTransferTaskInput {
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
   batchSize: number;
+  commitIntervalBatches?: number;
+  parallelTables?: number;
   skipCount?: boolean;
 }
 
@@ -83,6 +85,8 @@ export const useTransferTaskStore = defineStore("transferTask", () => {
           mode: input.mode,
           targetTableNameCase: input.targetTableNameCase,
           batchSize: input.batchSize,
+          commitIntervalBatches: input.commitIntervalBatches ?? 50,
+          parallelTables: input.parallelTables ?? 1,
           skipCount: input.skipCount ?? false,
           updatedAt: timestamp,
         }
@@ -100,6 +104,8 @@ export const useTransferTaskStore = defineStore("transferTask", () => {
           mode: input.mode,
           targetTableNameCase: input.targetTableNameCase,
           batchSize: input.batchSize,
+          commitIntervalBatches: input.commitIntervalBatches ?? 50,
+          parallelTables: input.parallelTables ?? 1,
           skipCount: input.skipCount ?? false,
           orderIndex: maxOrderIndex(tasks.value) + 1,
           createdAt: timestamp,
