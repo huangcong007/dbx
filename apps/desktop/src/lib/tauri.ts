@@ -1709,6 +1709,8 @@ export interface TransferRequest {
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
   batchSize: number;
+  skipCount?: boolean;
+  commitIntervalBatches?: number;
 }
 
 export interface TransferTask {
@@ -1725,6 +1727,8 @@ export interface TransferTask {
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
   batchSize: number;
+  skipCount?: boolean;
+  commitIntervalBatches?: number;
   orderIndex?: number;
   lastRunAt?: string | null;
   createdAt: string;

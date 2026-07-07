@@ -2065,6 +2065,7 @@ export default withEnglishFallback({
     tableNameCaseLower: "小文字に変換",
     tableNameCaseUpper: "大文字に変換",
     batchSize: "バッチサイズ",
+    skipCount: "行数カウントをスキップ",
     start: "転送開始",
     cancel: "キャンセル",
     progress: "転送中...",

@@ -1965,6 +1965,7 @@ export default withEnglishFallback({
     modeOverwrite: "覆蓋 (TRUNCATE + INSERT)",
     modeUpsert: "更新插入 (按主鍵 INSERT 或 UPDATE)",
     batchSize: "每批筆數",
+    skipCount: "跳過行數統計",
     start: "開始傳輸",
     cancel: "取消",
     progress: "傳輸中……",

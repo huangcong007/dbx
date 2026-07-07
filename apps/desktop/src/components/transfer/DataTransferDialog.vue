@@ -68,7 +68,8 @@ const targetSchema = ref("");
 const createTable = ref(true);
 const transferMode = ref<TransferMode>("append");
 const targetTableNameCase = ref<TransferTableNameCase>("preserve");
-const batchSize = ref(1000);
+const batchSize = ref(5000);
+const skipCount = ref(false);
 const isSubmitting = ref(false);
 
 const filteredTables = computed(() => {
@@ -109,6 +110,7 @@ function buildTaskSummary(task: TransferTask) {
     `${t("transfer.transferMode")}: ${modeLabel(task.mode)}`,
     `${t("transfer.createTable")}: ${task.createTable ? t("transfer.yes") : t("transfer.no")}`,
     `${t("transfer.batchSize")}: ${task.batchSize}`,
+    `${t("transfer.skipCount")}: ${task.skipCount ? t("transfer.yes") : t("transfer.no")}`,
   ].join("\n");
 }
 
@@ -127,6 +129,7 @@ function currentTaskInput() {
     mode: transferMode.value,
     targetTableNameCase: targetTableNameCase.value,
     batchSize: batchSize.value,
+    skipCount: skipCount.value,
   };
 }
 
@@ -146,6 +149,7 @@ function buildTransferRequestFromForm(transferId = uuid()): api.TransferRequest 
     mode: transferMode.value,
     targetTableNameCase: targetTableNameCase.value,
     batchSize: batchSize.value,
+    skipCount: skipCount.value,
   };
 }
 
@@ -163,6 +167,7 @@ function buildTransferRequestFromTask(task: TransferTask, transferId = uuid()): 
     mode: task.mode,
     targetTableNameCase: task.targetTableNameCase,
     batchSize: task.batchSize,
+    skipCount: task.skipCount,
   };
 }
 
@@ -357,7 +362,8 @@ function resetState() {
   createTable.value = true;
   transferMode.value = "append";
   targetTableNameCase.value = "preserve";
-  batchSize.value = 1000;
+  batchSize.value = 5000;
+  skipCount.value = false;
   isSubmitting.value = false;
   pendingTableSelection.value = null;
   skipSourceWatch.value = false;
@@ -372,6 +378,7 @@ async function loadTaskIntoForm(task: TransferTask) {
   transferMode.value = task.mode;
   targetTableNameCase.value = task.targetTableNameCase;
   batchSize.value = task.batchSize;
+  skipCount.value = task.skipCount ?? false;
   pendingTableSelection.value = [...task.tables];
   selectedTables.value = new Set(task.tables);
 
@@ -748,7 +755,12 @@ function formatLastRunAt(value?: string | null) {
             </div>
             <div class="flex items-center gap-3">
               <Label class="text-xs shrink-0">{{ t("transfer.batchSize") }}</Label>
-              <Input v-model.number="batchSize" type="number" min="100" max="10000" step="100" class="h-7 text-xs w-24" />
+              <Input v-model.number="batchSize" type="number" min="100" max="20000" step="100" class="h-7 text-xs w-24" />
+            </div>
+            <div class="flex items-center gap-2 cursor-pointer text-xs" @click="skipCount = !skipCount">
+              <CheckSquare v-if="skipCount" class="w-3.5 h-3.5 text-primary shrink-0" />
+              <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
+              {{ t("transfer.skipCount") }}
             </div>
           </div>
         </div>

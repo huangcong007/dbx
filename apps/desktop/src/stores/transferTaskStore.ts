@@ -18,6 +18,7 @@ export interface SaveTransferTaskInput {
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
   batchSize: number;
+  skipCount?: boolean;
 }
 
 function nowIso() {
@@ -82,6 +83,7 @@ export const useTransferTaskStore = defineStore("transferTask", () => {
           mode: input.mode,
           targetTableNameCase: input.targetTableNameCase,
           batchSize: input.batchSize,
+          skipCount: input.skipCount ?? false,
           updatedAt: timestamp,
         }
       : {
@@ -98,6 +100,7 @@ export const useTransferTaskStore = defineStore("transferTask", () => {
           mode: input.mode,
           targetTableNameCase: input.targetTableNameCase,
           batchSize: input.batchSize,
+          skipCount: input.skipCount ?? false,
           orderIndex: maxOrderIndex(tasks.value) + 1,
           createdAt: timestamp,
           updatedAt: timestamp,

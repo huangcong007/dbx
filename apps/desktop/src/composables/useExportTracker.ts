@@ -29,6 +29,7 @@ export interface ExportTask {
   targetDatabase?: string;
   targetSchema?: string;
   targetTables?: string[];
+  startedAt?: number;
 }
 
 const taskMap = reactive<Map<string, ExportTask>>(new Map());
@@ -165,6 +166,7 @@ export function useExportTracker() {
       tableIndex: 0,
       totalTables,
       currentTable: "",
+      startedAt: Date.now(),
     });
     taskMap.set(transferId, task);
     return task;
@@ -277,6 +279,10 @@ export function useExportTracker() {
       task.rowsExported = progress.rowsTransferred;
     }
     task.totalRows = progress.totalRows ?? task.totalRows;
+    // 累计已运行时长：运行中实时更新，进入终态后定格在最终耗时
+    if (task.startedAt) {
+      task.elapsedMs = Date.now() - task.startedAt;
+    }
   }
 
   function removeTask(exportId: string) {

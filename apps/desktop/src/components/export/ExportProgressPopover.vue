@@ -34,6 +34,17 @@ const progressPercent = (totalRows: number | null, rowsExported: number) => {
   return Math.min(100, Math.round((rowsExported / totalRows) * 100));
 };
 
+// 将毫秒格式化为紧凑的时长字符串：1h 2m 3s / 2m 3s / 3s / 0s
+const formatDuration = (ms: number): string => {
+  const totalSeconds = Math.floor(ms / 1000);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+};
+
 const progressValue = (task: ExportTask) => {
   if (task.kind === "database-export") {
     if (!task.totalObjects || task.totalObjects <= 0) return 0;
@@ -170,6 +181,7 @@ function toggleShowAll() {
 
             <div class="min-w-0 text-muted-foreground">
               <span class="break-words tabular-nums">{{ rowsText(task) }}</span>
+              <span v-if="task.elapsedMs != null" class="ml-2 text-muted-foreground/70 tabular-nums">{{ formatDuration(task.elapsedMs) }}</span>
               <span v-if="task.status === 'Error' && task.errorMessage" class="mt-1 block whitespace-normal break-words text-destructive" :title="task.errorMessage">
                 {{ task.errorMessage }}
               </span>

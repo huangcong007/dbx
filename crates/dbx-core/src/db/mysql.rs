@@ -2165,6 +2165,23 @@ pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Resul
         .map_err(|e| e.to_string())
 }
 
+/// Acquire a dedicated connection from the pool for transactional use.
+///
+/// The caller must hold the returned `Conn` for the duration of the transaction
+/// and drop it to return it to the pool. This is required because `execute_on_pool`
+/// acquires a fresh connection per call, so `START TRANSACTION` / `COMMIT` sent
+/// through it would land on different connections and silently no-op.
+pub async fn acquire_dedicated_conn(pool: &MySqlPool) -> Result<mysql_async::Conn, String> {
+    get_conn_with_health_check(pool).await
+}
+
+/// Execute a SQL statement that produces no result set on a dedicated connection.
+/// Used for `START TRANSACTION`, `COMMIT`, `ROLLBACK`, and write statements
+/// during transactional transfer.
+pub async fn exec_drop_on_conn(conn: &mut mysql_async::Conn, sql: &str) -> Result<(), String> {
+    conn.query_drop(sql).await.map_err(|e| e.to_string())
+}
+
 async fn ping_conn_with_timeout_and_cancel(
     conn: &mut mysql_async::Conn,
     timeout: Duration,

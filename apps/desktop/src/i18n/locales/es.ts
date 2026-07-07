@@ -2065,6 +2065,7 @@ export default withEnglishFallback({
     tableNameCaseLower: "Convertir a minúsculas",
     tableNameCaseUpper: "Convertir a mayúsculas",
     batchSize: "Tamaño de lote",
+    skipCount: "Omitir conteo de filas",
     start: "Iniciar transferencia",
     cancel: "Cancelar",
     progress: "Transfiriendo...",

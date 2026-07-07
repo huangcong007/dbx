@@ -21,6 +21,10 @@ pub struct TransferTask {
     pub target_table_name_case: TransferTableNameCase,
     pub batch_size: usize,
     #[serde(default)]
+    pub skip_count: bool,
+    #[serde(default)]
+    pub commit_interval_batches: Option<usize>,
+    #[serde(default)]
     pub order_index: i64,
     pub last_run_at: Option<String>,
     pub created_at: String,

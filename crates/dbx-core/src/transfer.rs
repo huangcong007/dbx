@@ -56,6 +56,19 @@ pub struct TransferRequest {
     #[serde(default)]
     pub target_table_name_case: TransferTableNameCase,
     pub batch_size: usize,
+    /// When true, skip the upfront `COUNT(*)` on the source table. The progress
+    /// callback will report `total_rows: None` and the UI should render an
+    /// indeterminate progress bar. Useful for large InnoDB tables where COUNT(*)
+    /// is a full table scan and only used for progress display.
+    #[serde(default)]
+    pub skip_count: bool,
+    /// Number of write batches to accumulate inside a single transaction before
+    /// committing on the target. `None` falls back to a sensible default (10).
+    /// Setting this to `0` disables transaction wrapping entirely (legacy
+    /// autocommit-per-batch behaviour). Only applied for databases that support
+    /// multi-statement transactions (MySQL/PG/SQLite/DuckDB families).
+    #[serde(default)]
+    pub commit_interval_batches: Option<usize>,
 }
 
 impl TransferRequest {
@@ -1130,8 +1143,30 @@ fn is_timezone_suffix(value: &str) -> bool {
     )
 }
 
+/// 剥离 MySQL COLUMN_TYPE 中的 `CHARACTER SET <charset>` 和 `COLLATE <collation>` 子句。
+///
+/// 例如 `varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci` → `varchar(255)`。
+/// 保留 `varchar(255)`、`int unsigned`、`decimal(10,2)`、`enum('a','b')` 等核心类型定义。
+/// 注意：enum/set 内部的字符串字面量不会被误伤（CHARACTER SET/COLLATE 只出现在类型外部）。
+fn strip_mysql_collation_clauses(source_type: &str) -> String {
+    // 匹配列级 `CHARACTER SET xxx` / `COLLATE xxx` 和表级
+    // `DEFAULT CHARSET=xxx` / `DEFAULT CHARACTER SET xxx` / `COLLATE=xxx`。
+    // 覆盖 SHOW CREATE TABLE 输出的完整 DDL 与 information_schema.COLUMN_TYPE 两种来源。
+    let re = Regex::new(
+        r"(?i)\s+(?:CHARACTER\s+SET|COLLATE|DEFAULT\s+CHARSET|DEFAULT\s+CHARACTER\s+SET)\s*[=]?\s*[A-Za-z0-9_.]+",
+    )
+    .expect("valid mysql collation strip regex");
+    re.replace_all(source_type, "").trim().to_string()
+}
+
 pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: &DatabaseType) -> String {
     if _source_db == target_db {
+        // MySQL 8.0 的 COLUMN_TYPE 会带上 `CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`
+        // 等子句，跨版本（如目标为 5.7/MariaDB）时目标库可能不认识该 collation 而报
+        // `Unknown collation`。这里剥离这些子句，让目标库使用自身默认 collation。
+        if is_mysql_family_target(target_db) {
+            return strip_mysql_collation_clauses(source_type);
+        }
         return source_type.to_string();
     }
     let t = source_type.to_lowercase();
@@ -1412,6 +1447,9 @@ pub fn generate_create_table_ddl(
         }
     }
 
+    log::info!(
+        "[transfer] generate_create_table_ddl for `{full_table}` (source={source_db:?} target={target_db:?}):\n{ddl}"
+    );
     ddl
 }
 
@@ -1698,10 +1736,17 @@ fn rewrite_transfer_source_table_ddl(
     target_db_type: &DatabaseType,
 ) -> String {
     if is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type) {
-        rewrite_postgres_schema_qualified_references(sql, source_schema, target_schema)
-    } else {
-        sql.to_string()
+        return rewrite_postgres_schema_qualified_references(sql, source_schema, target_schema);
     }
+    // MySQL family: 源库（如 MySQL 8.0）SHOW CREATE TABLE 输出的 DDL 会带上
+    // `CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`（列级）以及
+    // `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`（表级）。跨版本（如目标
+    // 为 5.7/MariaDB）时目标库可能不认识该 collation 而报 `Unknown collation`。
+    // 这里剥离这些子句，让目标库使用自身默认 collation。
+    if is_mysql_family_target(target_db_type) {
+        return strip_mysql_collation_clauses(sql);
+    }
+    sql.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1737,6 +1782,84 @@ fn generate_transfer_write_sql_batches(
     }
 
     let max_rows = max_transfer_write_rows(db_type, mode);
+
+    // MERGE-style upserts (SqlServer, Oracle) have a 3-part SQL structure
+    // (prefix + values + middle + suffix) that doesn't fit the simple
+    // prefix+values+suffix pattern. These paths also use small hard-coded
+    // row caps (500/1000), so the legacy O(n²) regeneration is acceptable.
+    if matches!(mode, TransferMode::Upsert) && matches!(db_type, DatabaseType::SqlServer | DatabaseType::Oracle) {
+        return generate_transfer_write_sql_batches_legacy(
+            mode,
+            columns,
+            column_types,
+            rows,
+            table,
+            schema,
+            db_type,
+            pk_columns,
+            max_rows,
+        );
+    }
+
+    // Optimized path: precompute the escaped value tuple for each row ONCE
+    // (this is where the per-cell escape_value_typed cost lives), then pack
+    // rows into statements incrementally. Reduces batch generation from
+    // O(n²) to O(n) for the common INSERT-style paths used by MySQL/PG/etc.
+    let value_rows: Vec<String> = value_rows_sql(rows, column_types, db_type);
+    let (prefix, suffix) = transfer_write_sql_prefix_suffix(mode, columns, table, schema, db_type, pk_columns);
+
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let base_len = prefix.len() + suffix.len();
+
+    while start < rows.len() {
+        let mut end = start;
+        let mut current_len = base_len;
+        let mut first_in_batch = true;
+
+        while end < rows.len() && end - start < max_rows {
+            // First row contributes just its value; subsequent rows add ",\n" separator.
+            let sep_len = if first_in_batch { 0 } else { 2 };
+            let row_len = sep_len + value_rows[end].len();
+
+            if !first_in_batch && current_len + row_len > MAX_TRANSFER_WRITE_SQL_BYTES {
+                break;
+            }
+
+            current_len += row_len;
+            first_in_batch = false;
+            end += 1;
+        }
+
+        // Always emit at least one row even if it exceeds the byte limit
+        // (a single row can't be split further).
+        if end == start {
+            end = start + 1;
+        }
+
+        let batch_values = value_rows[start..end].join(",\n");
+        statements.push(format!("{prefix}{batch_values}{suffix}"));
+
+        start = end;
+    }
+
+    statements
+}
+
+/// Legacy O(n²) batch generator used for MERGE-style upserts whose SQL
+/// structure can't be decomposed into a simple prefix+values+suffix form.
+#[allow(clippy::too_many_arguments)]
+fn generate_transfer_write_sql_batches_legacy(
+    mode: &TransferMode,
+    columns: &[String],
+    column_types: &[Option<String>],
+    rows: &[Vec<serde_json::Value>],
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    pk_columns: &[String],
+    max_rows: usize,
+) -> Vec<String> {
     let mut statements = Vec::new();
     let mut start = 0;
 
@@ -1778,6 +1901,74 @@ fn generate_transfer_write_sql_batches(
     }
 
     statements
+}
+
+/// Build the (prefix, suffix) strings that wrap the joined `VALUES (...)` rows
+/// for an INSERT-style write statement. Only valid for INSERT-style paths
+/// (Append, Overwrite, or Upsert on MySQL/PG/SQLite/DuckDB families). The
+/// caller must use the legacy generator for MERGE-style upserts (SqlServer/Oracle).
+#[allow(clippy::too_many_arguments)]
+fn transfer_write_sql_prefix_suffix(
+    mode: &TransferMode,
+    columns: &[String],
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    pk_columns: &[String],
+) -> (String, String) {
+    let full_table = qualified_table(table, schema, db_type);
+    let col_list = columns.iter().map(|c| quote_identifier(c, db_type)).collect::<Vec<_>>().join(", ");
+    let prefix = format!("INSERT INTO {full_table} ({col_list}) VALUES\n");
+
+    let suffix = match mode {
+        TransferMode::Append | TransferMode::Overwrite => String::new(),
+        TransferMode::Upsert => {
+            let mut non_pk_columns: Vec<&String> = Vec::with_capacity(columns.len().saturating_sub(pk_columns.len()));
+            for c in columns {
+                if !pk_columns.contains(c) {
+                    non_pk_columns.push(c);
+                }
+            }
+            match db_type {
+                DatabaseType::Postgres | DatabaseType::Sqlite | DatabaseType::DuckDb => {
+                    let pk_list =
+                        pk_columns.iter().map(|c| quote_identifier(c, db_type)).collect::<Vec<_>>().join(", ");
+                    if non_pk_columns.is_empty() {
+                        format!("\nON CONFLICT ({pk_list}) DO NOTHING")
+                    } else {
+                        let update_set = non_pk_columns
+                            .iter()
+                            .map(|c| {
+                                let qc = quote_identifier(c, db_type);
+                                format!("{qc} = EXCLUDED.{qc}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("\nON CONFLICT ({pk_list}) DO UPDATE SET {update_set}")
+                    }
+                }
+                DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => {
+                    if non_pk_columns.is_empty() {
+                        let first_pk = quote_identifier(&pk_columns[0], db_type);
+                        format!("\nON DUPLICATE KEY UPDATE {first_pk} = {first_pk}")
+                    } else {
+                        let update_set = non_pk_columns
+                            .iter()
+                            .map(|c| {
+                                let qc = quote_identifier(c, db_type);
+                                format!("{qc} = VALUES({qc})")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("\nON DUPLICATE KEY UPDATE {update_set}")
+                    }
+                }
+                _ => String::new(), // catch-all: plain INSERT (e.g. Dameng)
+            }
+        }
+    };
+
+    (prefix, suffix)
 }
 
 pub fn pagination_sql(
@@ -3216,7 +3407,7 @@ where
 {
     let total_tables = request.tables.len();
     let target_table = request.target_table_name(table);
-    let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
+    let batch_size = if request.batch_size == 0 { 5000 } else { request.batch_size };
     let mut offset: u64 = 0;
     let mut total_transferred: u64 = 0;
     let mut total_rows = None;
@@ -3571,8 +3762,11 @@ where
             Vec::new()
         };
 
-    // Count source rows
-    let total_rows = {
+    // Count source rows (skippable for large tables where COUNT(*) is expensive)
+    let total_rows = if request.skip_count {
+        log::info!("[transfer] {} skip_count=true, skipping COUNT(*)", table);
+        None
+    } else {
         let sql = count_sql(table, &request.source_schema, source_db_type);
         match execute_on_pool(state, source_pool_key, &sql).await {
             Ok(result) => result.rows.first().and_then(|r| r.first()).and_then(|v| match v {
@@ -3746,29 +3940,119 @@ where
     };
 
     // Transfer data in batches
-    let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
+    let batch_size = if request.batch_size == 0 { 5000 } else { request.batch_size };
     let mut offset: u64 = 0;
     let mut total_transferred: u64 = 0;
 
+    // Keyset pagination: when the source table has a primary key, use cursor-based
+    // pagination (WHERE pk > last_pk) instead of OFFSET. OFFSET pagination on large
+    // tables is O(n²) because the database must scan and discard `offset` rows on
+    // every batch. Keyset pagination is O(log n) per batch.
+    let use_keyset = !primary_key_columns.is_empty();
+    let pk_indices: Vec<usize> = if use_keyset {
+        primary_key_columns
+            .iter()
+            .map(|pk| col_names.iter().position(|c| c.eq_ignore_ascii_case(pk)).unwrap_or(0))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut last_pk_values: Vec<serde_json::Value> = Vec::new();
+
+    // Transaction wrapping: for MySQL targets, batch writes inside explicit
+    // transactions to avoid per-statement fsync (innodb_flush_log_at_trx_commit=1
+    // by default). This can improve write throughput 5-10x on InnoDB. We hold a
+    // dedicated connection because START TRANSACTION / COMMIT must execute on the
+    // same connection — execute_on_pool acquires a fresh conn per call.
+    let commit_interval = request.commit_interval_batches.unwrap_or(10);
+    let use_transaction = commit_interval > 0 && matches!(target_db_type, DatabaseType::Mysql);
+
+    let mut tx_conn: Option<mysql_async::Conn> = if use_transaction {
+        let pool = {
+            let connections = state.connections.read().await;
+            match connections.get(target_pool_key) {
+                Some(PoolKind::Mysql(p, _)) => Some(p.clone()),
+                _ => None,
+            }
+        };
+        match pool {
+            Some(p) => match db::mysql::acquire_dedicated_conn(&p).await {
+                Ok(mut conn) => match db::mysql::exec_drop_on_conn(&mut conn, "START TRANSACTION").await {
+                    Ok(()) => {
+                        log::info!(
+                            "[transfer] {} transaction wrapping enabled (commit every {} batches)",
+                            table,
+                            commit_interval
+                        );
+                        Some(conn)
+                    }
+                    Err(e) => {
+                        log::warn!("[transfer] failed to start transaction, falling back to autocommit: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    log::warn!("[transfer] failed to acquire dedicated connection: {}, falling back to autocommit", e);
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut batches_since_commit = 0usize;
+
     loop {
         if is_cancelled(&request.transfer_id).await {
+            if let Some(ref mut conn) = tx_conn {
+                let _ = db::mysql::exec_drop_on_conn(conn, "ROLLBACK").await;
+            }
             return Err("Cancelled".to_string());
         }
 
-        let sql = pagination_sql_with_order(
-            &col_names,
-            table,
-            &request.source_schema,
-            source_db_type,
-            offset,
-            batch_size,
-            &primary_key_columns,
-        );
-        let result = execute_on_pool(state, source_pool_key, &sql).await?;
+        // Build pagination SQL: keyset (cursor-based) when PKs exist, OFFSET otherwise
+        let sql = if use_keyset {
+            keyset_pagination_sql(
+                &col_names,
+                table,
+                &request.source_schema,
+                source_db_type,
+                &primary_key_columns,
+                &last_pk_values,
+                batch_size,
+            )
+        } else {
+            pagination_sql_with_order(
+                &col_names,
+                table,
+                &request.source_schema,
+                source_db_type,
+                offset,
+                batch_size,
+                &primary_key_columns,
+            )
+        };
+        let result = match execute_on_pool(state, source_pool_key, &sql).await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(ref mut conn) = tx_conn {
+                    let _ = db::mysql::exec_drop_on_conn(conn, "ROLLBACK").await;
+                }
+                return Err(e);
+            }
+        };
         let row_count = result.rows.len();
 
         if row_count == 0 {
             break;
+        }
+
+        // Update keyset cursor: extract PK values from the last row of this batch
+        if use_keyset {
+            if let Some(last_row) = result.rows.last() {
+                last_pk_values = pk_indices.iter().filter_map(|&i| last_row.get(i).cloned()).collect();
+            }
         }
 
         let write_statements = generate_transfer_write_sql_batches(
@@ -3782,19 +4066,26 @@ where
             &pk_columns,
         );
         for (statement_index, batch_sql) in write_statements.iter().enumerate() {
-            execute_transfer_write_statement(
-                state,
-                target_pool_key,
-                batch_sql,
-                target_db_type,
-                &target_table,
-                &request.target_schema,
-                writes_dameng_identity_columns,
-            )
-            .await
-            .map_err(|e| {
+            let write_err = if let Some(ref mut conn) = tx_conn {
+                db::mysql::exec_drop_on_conn(conn, batch_sql).await
+            } else {
+                execute_transfer_write_statement(
+                    state,
+                    target_pool_key,
+                    batch_sql,
+                    target_db_type,
+                    &target_table,
+                    &request.target_schema,
+                    writes_dameng_identity_columns,
+                )
+                .await
+            };
+            if let Err(e) = write_err {
+                if let Some(ref mut conn) = tx_conn {
+                    let _ = db::mysql::exec_drop_on_conn(conn, "ROLLBACK").await;
+                }
                 let absolute_row = parse_mysql_row_error(&e).map(|row| offset + row);
-                match absolute_row {
+                return Err(match absolute_row {
                     Some(row) => format!(
                         "Insert failed for table '{target_table}' at row {row} (chunk {} of {}): {e}",
                         statement_index + 1,
@@ -3805,13 +4096,28 @@ where
                         statement_index + 1,
                         write_statements.len()
                     ),
-                }
-            })?;
+                });
+            }
         }
 
         total_transferred += row_count as u64;
         log::info!("[transfer] {} batch +{} rows (total {})", table, row_count, total_transferred);
         offset += row_count as u64;
+
+        // Commit transaction periodically to bound undo log size
+        if let Some(ref mut conn) = tx_conn {
+            batches_since_commit += 1;
+            if batches_since_commit >= commit_interval {
+                if let Err(e) = db::mysql::exec_drop_on_conn(conn, "COMMIT").await {
+                    let _ = db::mysql::exec_drop_on_conn(conn, "ROLLBACK").await;
+                    return Err(format!("Failed to commit transaction for {target_table}: {e}"));
+                }
+                if let Err(e) = db::mysql::exec_drop_on_conn(conn, "START TRANSACTION").await {
+                    return Err(format!("Failed to start new transaction for {target_table}: {e}"));
+                }
+                batches_since_commit = 0;
+            }
+        }
 
         progress_callback(TransferProgress {
             transfer_id: request.transfer_id.clone(),
@@ -3828,6 +4134,21 @@ where
             break;
         }
     }
+
+    // Commit or roll back before post-transfer DDL so the connection returns to the
+    // pool without an open transaction (covers empty tables and batches that ended
+    // exactly on a commit_interval boundary).
+    if let Some(ref mut conn) = tx_conn {
+        if batches_since_commit > 0 {
+            if let Err(e) = db::mysql::exec_drop_on_conn(conn, "COMMIT").await {
+                let _ = db::mysql::exec_drop_on_conn(conn, "ROLLBACK").await;
+                return Err(format!("Failed to commit final transaction for {target_table}: {e}"));
+            }
+        } else {
+            let _ = db::mysql::exec_drop_on_conn(conn, "ROLLBACK").await;
+        }
+    }
+    // tx_conn is dropped here, returning the connection to the pool
 
     if pg_compat_transfer {
         for statement in generate_postgres_sequence_sync_sql(&columns, &target_table, &request.target_schema) {

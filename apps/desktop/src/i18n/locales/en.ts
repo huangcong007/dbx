@@ -2064,6 +2064,7 @@ export default {
     tableNameCaseLower: "Lowercase",
     tableNameCaseUpper: "Uppercase",
     batchSize: "Batch size",
+    skipCount: "Skip row count",
     start: "Start Transfer",
     cancel: "Cancel",
     progress: "Transferring...",

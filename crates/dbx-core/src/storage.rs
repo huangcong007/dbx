@@ -288,6 +288,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         mode TEXT NOT NULL DEFAULT 'append',
         target_table_name_case TEXT NOT NULL DEFAULT 'preserve',
         batch_size INTEGER NOT NULL DEFAULT 1000,
+        skip_count INTEGER NOT NULL DEFAULT 0,
+        commit_interval_batches INTEGER,
         order_index INTEGER NOT NULL DEFAULT 0,
         last_run_at TEXT,
         created_at TEXT NOT NULL DEFAULT '',
@@ -311,6 +313,7 @@ impl Storage {
             }
             ensure_history_columns_sync(conn)?;
             ensure_saved_sql_columns_sync(conn)?;
+            ensure_transfer_tasks_columns_sync(conn)?;
             Ok(())
         })
     }
@@ -422,6 +425,12 @@ fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
     ensure_table_columns(conn, "saved_sql_folders", FOLDER_COLUMNS)?;
     ensure_table_columns(conn, "saved_sql_files", FILE_COLUMNS)?;
     Ok(())
+}
+
+fn ensure_transfer_tasks_columns_sync(conn: &Connection) -> Result<(), String> {
+    const COLUMNS: &[(&str, &str)] =
+        &[("skip_count", "INTEGER NOT NULL DEFAULT 0"), ("commit_interval_batches", "INTEGER")];
+    ensure_table_columns(conn, "transfer_tasks", COLUMNS)
 }
 
 fn ensure_table_columns(conn: &Connection, table_name: &str, columns: &[(&str, &str)]) -> Result<(), String> {
@@ -1593,7 +1602,7 @@ impl Storage {
                 .prepare(
                     "SELECT id, name, source_connection_id, source_database, source_schema, \
                      target_connection_id, target_database, target_schema, tables_json, create_table, \
-                     mode, target_table_name_case, batch_size, order_index, last_run_at, created_at, updated_at \
+                     mode, target_table_name_case, batch_size, skip_count, commit_interval_batches, order_index, last_run_at, created_at, updated_at \
                      FROM transfer_tasks ORDER BY order_index, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -1620,10 +1629,12 @@ impl Storage {
                         mode,
                         target_table_name_case,
                         batch_size: row.get::<_, i64>(12)? as usize,
-                        order_index: row.get(13)?,
-                        last_run_at: row.get(14)?,
-                        created_at: row.get(15)?,
-                        updated_at: row.get(16)?,
+                        skip_count: row.get::<_, i64>(13)? != 0,
+                        commit_interval_batches: row.get::<_, Option<i64>>(14)?.map(|v| v as usize),
+                        order_index: row.get(15)?,
+                        last_run_at: row.get(16)?,
+                        created_at: row.get(17)?,
+                        updated_at: row.get(18)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -1647,8 +1658,8 @@ impl Storage {
                 "INSERT INTO transfer_tasks \
                  (id, name, source_connection_id, source_database, source_schema, \
                  target_connection_id, target_database, target_schema, tables_json, create_table, \
-                 mode, target_table_name_case, batch_size, order_index, last_run_at, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 mode, target_table_name_case, batch_size, skip_count, commit_interval_batches, order_index, last_run_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, \
                  source_connection_id = excluded.source_connection_id, \
@@ -1662,6 +1673,8 @@ impl Storage {
                  mode = excluded.mode, \
                  target_table_name_case = excluded.target_table_name_case, \
                  batch_size = excluded.batch_size, \
+                 skip_count = excluded.skip_count, \
+                 commit_interval_batches = excluded.commit_interval_batches, \
                  order_index = excluded.order_index, \
                  last_run_at = excluded.last_run_at, \
                  updated_at = excluded.updated_at",
@@ -1679,6 +1692,8 @@ impl Storage {
                     mode,
                     target_table_name_case,
                     task.batch_size as i64,
+                    if task.skip_count { 1 } else { 0 },
+                    task.commit_interval_batches.map(|v| v as i64),
                     task.order_index,
                     task.last_run_at,
                     task.created_at,
